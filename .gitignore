@@ -1,0 +1,8 @@
+*.o
+*.obj
+orb_recorder
+
+# Internal backlog -- development notes, not software documentation.
+# Lives in the private mirrors; not part of what ships.
+IDEAS.md
+NOTE.md

@@ -1,0 +1,1444 @@
+/*
+ * platform_win32.c -- Windows implementation of platform.h.
+ * Extracted from the original gif_orb.c (v1..v2).
+ * Alex Maz -- ORB_Recorder (2026).
+ */
+/* Win7+ APIs: TokenElevation, TokenIntegrityLevel, ChangeWindowMessageFilterEx */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+/* C-callable COM: gives IFoo_Method(ptr, ...) instead of ptr->lpVtbl->Method.
+ * Needed for the WIC enumeration below. */
+#define COBJMACROS
+
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
+#include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <objbase.h>       /* CoInitializeEx / CoUninitialize */
+#include <shobjidl.h>      /* IShellItemImageFactory */
+#include <shlwapi.h>
+#include <commdlg.h>
+#include <wincodec.h>
+#include <wchar.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "platform.h"
+
+#define IDI_ORB         101
+#define HOTKEY_ID_F5    0xB055
+#define HOTKEY_ID_ESC   0xB056
+#define HOTKEY_ID_F6    0xB057
+#define HOTKEY_ID_F7    0xB058
+#define HOTKEY_ID_F8    0xB059
+#define HOTKEY_ID_F9    0xB05A
+#define HOTKEY_ID_F4    0xB05B
+#define HOTKEY_ID_PRTSC 0xB05C
+
+/* ---- time ------------------------------------------------------------- */
+uint64_t plat_now_ms(void) { return (uint64_t)GetTickCount64(); }
+void     plat_sleep_ms(int ms) { Sleep((DWORD)ms); }
+
+/* ---- paths ------------------------------------------------------------ */
+void plat_get_log_path(char* out, size_t sz) {
+    char base[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base))) {
+        snprintf(out, sz, "%s\\ORB_Recorder", base);
+        CreateDirectoryA(out, NULL);
+        strncat(out, "\\log.txt", sz - strlen(out) - 1);
+    } else {
+        snprintf(out, sz, ".\\orb_recorder_log.txt");
+    }
+}
+
+void plat_get_output_dir(char* out, size_t sz) {
+    char path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_MYPICTURES, NULL, 0, path))) {
+        snprintf(out, sz, "%s\\ORB_Recorder", path);
+    } else {
+        snprintf(out, sz, ".\\ORB_Recorder");
+    }
+    CreateDirectoryA(out, NULL);
+}
+
+void plat_get_config_path(char* out, size_t sz) {
+    char base[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base))) {
+        snprintf(out, sz, "%s\\ORB_Recorder", base);
+        CreateDirectoryA(out, NULL);
+        strncat(out, "\\settings.ini", sz - strlen(out) - 1);
+
+        /* Carry settings over from the old name. Renaming the program should
+         * not silently reset where the user parked the orb, how big they made
+         * it, or which hotkeys they released -- those are hard-won choices and
+         * losing them feels like a bug even when the rename was deliberate.
+         * Copied, not moved: if they run an older build it still works. */
+        if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES) {
+            char legacy[MAX_PATH];
+            snprintf(legacy, sizeof legacy, "%s\\GIF_Recorder\\settings.ini", base);
+            if (GetFileAttributesA(legacy) != INVALID_FILE_ATTRIBUTES)
+                CopyFileA(legacy, out, TRUE);
+        }
+    } else {
+        snprintf(out, sz, ".\\orb_recorder_settings.ini");
+    }
+}
+
+/* ---- privilege / integrity level -------------------------------------- */
+
+bool plat_process_is_elevated(void) {
+    BOOL elevated = FALSE;
+    HANDLE tok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION el;
+        DWORD sz = sizeof el;
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof el, &sz))
+            elevated = el.TokenIsElevated;
+        CloseHandle(tok);
+    }
+    return elevated != FALSE;
+}
+
+/* Integrity RID of a token: MEDIUM = 0x2000, HIGH = 0x3000, SYSTEM = 0x4000. */
+static DWORD token_integrity_rid(HANDLE tok) {
+    DWORD size = 0, rid = 0;
+    GetTokenInformation(tok, TokenIntegrityLevel, NULL, 0, &size);
+    if (!size) return 0;
+    TOKEN_MANDATORY_LABEL* lbl = (TOKEN_MANDATORY_LABEL*)malloc(size);
+    if (!lbl) return 0;
+    if (GetTokenInformation(tok, TokenIntegrityLevel, lbl, size, &size)) {
+        UCHAR* cnt = GetSidSubAuthorityCount(lbl->Label.Sid);
+        if (cnt && *cnt > 0)
+            rid = *GetSidSubAuthority(lbl->Label.Sid, (DWORD)(*cnt - 1));
+    }
+    free(lbl);
+    return rid;
+}
+
+/* True when the target window's process runs at a HIGHER integrity level
+ * than us -- i.e. UIPI will block PrintWindow against it. */
+bool plat_window_is_elevated(void* native_handle) {
+    HWND h = (HWND)native_handle;
+    if (!h || !IsWindow(h)) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid) return false;
+    if (pid == GetCurrentProcessId()) return false;
+
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) {
+        /* Cannot even query it with LIMITED rights -- treat as higher. */
+        return true;
+    }
+    HANDLE their_tok = NULL;
+    bool higher = false;
+    if (!OpenProcessToken(proc, TOKEN_QUERY, &their_tok)) {
+        /* Access denied opening their token is the classic signature of a
+         * higher-integrity process seen from a medium-integrity one. */
+        higher = (GetLastError() == ERROR_ACCESS_DENIED);
+    } else {
+        DWORD theirs = token_integrity_rid(their_tok);
+        CloseHandle(their_tok);
+        HANDLE mine_tok = NULL;
+        DWORD mine = 0;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mine_tok)) {
+            mine = token_integrity_rid(mine_tok);
+            CloseHandle(mine_tok);
+        }
+        higher = (theirs > mine);
+    }
+    CloseHandle(proc);
+    return higher;
+}
+
+bool plat_restart_elevated(void) {
+    char exe[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, exe, MAX_PATH)) return false;
+    SHELLEXECUTEINFOA sei;
+    memset(&sei, 0, sizeof sei);
+    sei.cbSize = sizeof sei;
+    sei.fMask  = SEE_MASK_NOASYNC;
+    sei.lpVerb = "runas";            /* prompts UAC */
+    sei.lpFile = exe;
+    sei.nShow  = SW_SHOWNORMAL;
+    if (ShellExecuteExA(&sei)) return true;
+    return false;                    /* user declined the UAC prompt */
+}
+
+/* ---- activation detection (taskbar click) -----------------------------
+ * We subclass GLFW's WndProc so we can observe activation messages that
+ * GLFW does not surface. WS_EX_NOACTIVATE stops the window taking focus,
+ * but the shell still sends restore/tasklist/activateapp traffic when the
+ * taskbar button is clicked -- that's what we watch for. */
+static WNDPROC       g_orig_wndproc = NULL;
+static volatile LONG g_activation   = 0;
+
+/* Tray */
+#define WM_ORB_TRAY (WM_APP + 17)
+#define ORB_TRAY_ID 1
+static volatile LONG g_tray_event = 0;
+static bool          g_tray_on    = false;
+
+static LRESULT CALLBACK orb_subclass_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ACTIVATEAPP:
+        if (wp) InterlockedExchange(&g_activation, 1);
+        break;
+    case WM_SYSCOMMAND: {
+        UINT sc = (UINT)(wp & 0xFFF0);
+        if (sc == SC_RESTORE || sc == SC_TASKLIST)
+            InterlockedExchange(&g_activation, 1);
+        break;
+    }
+    case WM_ACTIVATE:
+        if (LOWORD(wp) != WA_INACTIVE) InterlockedExchange(&g_activation, 1);
+        break;
+    case WM_SHOWWINDOW:
+        /* Restored from minimised / re-shown -- worth a locate flash. */
+        if (wp) InterlockedExchange(&g_activation, 1);
+        break;
+    case WM_ORB_TRAY:
+        if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK)
+            InterlockedExchange(&g_tray_event, PLAT_TRAY_LOCATE);
+        else if (LOWORD(lp) == WM_RBUTTONUP)
+            InterlockedExchange(&g_tray_event, PLAT_TRAY_MENU);
+        break;
+    default: break;
+    }
+    return CallWindowProc(g_orig_wndproc, h, msg, wp, lp);
+}
+
+bool plat_poll_activation(void) {
+    return InterlockedExchange(&g_activation, 0) != 0;
+}
+
+/* ---- system tray ------------------------------------------------------ */
+
+int plat_poll_tray(void) {
+    return (int)InterlockedExchange(&g_tray_event, 0);
+}
+
+/* Taskbar button on or off.
+ *
+ * WS_EX_TOOLWINDOW is what removes it, and Windows only notices the style
+ * change across a hide/show cycle -- setting it on a visible window does
+ * nothing, which is the classic way this is got wrong.
+ *
+ * Factored out because it has to be re-applied, not just applied: showing a
+ * popup menu requires SetForegroundWindow, and forcing a WS_EX_NOACTIVATE
+ * window to the foreground makes the shell re-evaluate it and give the button
+ * back. Joe found that -- right-click the orb in tray-only mode and the
+ * taskbar entry returned, and stayed until tray-only was toggled off and on,
+ * because that toggle was the only thing that ever re-applied the style. */
+static bool apply_taskbar_button(HWND h, bool hidden) {
+    LONG ex = GetWindowLong(h, GWL_EXSTYLE);
+
+    /* TWO bits decide this, not one.
+     *
+     * WS_EX_TOOLWINDOW asks for no taskbar button, but WS_EX_APPWINDOW
+     * OVERRIDES it and forces one -- and the shell sets APPWINDOW itself when
+     * a window is activated, which is precisely what showing a popup menu
+     * does. So the earlier version, which looked only at TOOLWINDOW, saw the
+     * flag still set, concluded the state was already correct, and returned
+     * while a taskbar button sat there in plain sight. That is why this
+     * survived two attempts at fixing it.
+     *
+     * The button is present if APPWINDOW is set, or if TOOLWINDOW is not. */
+    bool button_present = (ex & WS_EX_APPWINDOW) || !(ex & WS_EX_TOOLWINDOW);
+    if (button_present == !hidden) return false;   /* already right */
+
+    /* Windows only re-reads these across a hide/show cycle. */
+    ShowWindow(h, SW_HIDE);
+    if (hidden) {
+        ex |=  WS_EX_TOOLWINDOW;
+        ex &= ~WS_EX_APPWINDOW;             /* the one that was overriding */
+    } else {
+        ex &= ~WS_EX_TOOLWINDOW;
+        /* And ASK for the button, rather than merely stopping asking for it
+         * to be hidden. Clearing TOOLWINDOW is not enough on its own: this
+         * window is WS_EX_NOACTIVATE, and the shell will not always give an
+         * unactivatable window a taskbar entry by default. Turning tray-only
+         * off left no button at all until APPWINDOW was set explicitly. */
+        ex |=  WS_EX_APPWINDOW;
+    }
+    SetWindowLong(h, GWL_EXSTYLE, ex);
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    return true;                            /* we had to correct it */
+}
+
+void plat_tray_set(struct GLFWwindow* w, bool on, const char* tooltip) {
+    HWND h = glfwGetWin32Window(w);
+    NOTIFYICONDATAA nid;
+    memset(&nid, 0, sizeof nid);
+    nid.cbSize = sizeof nid;
+    nid.hWnd   = h;
+    nid.uID    = ORB_TRAY_ID;
+
+    if (!on) {
+        if (g_tray_on) { Shell_NotifyIconA(NIM_DELETE, &nid); g_tray_on = false; }
+        apply_taskbar_button(h, false);     /* give the button back */
+        return;
+    }
+
+    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_ORB_TRAY;
+    nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(NULL),
+                                  MAKEINTRESOURCEA(IDI_ORB),
+                                  IMAGE_ICON,
+                                  GetSystemMetrics(SM_CXSMICON),
+                                  GetSystemMetrics(SM_CYSMICON),
+                                  LR_DEFAULTCOLOR);
+    if (!nid.hIcon) nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    snprintf(nid.szTip, sizeof nid.szTip, "%s", tooltip ? tooltip : "ORB_Recorder");
+
+    if (!g_tray_on) {
+        if (Shell_NotifyIconA(NIM_ADD, &nid)) g_tray_on = true;
+    } else {
+        Shell_NotifyIconA(NIM_MODIFY, &nid);
+    }
+
+    /* The orb itself stays visible and on top; only the taskbar entry goes. */
+    apply_taskbar_button(h, true);
+}
+
+/* ---- native window ---------------------------------------------------- */
+void plat_window_setup(struct GLFWwindow* w) {
+    HWND h = glfwGetWin32Window(w);
+    /* Layered + topmost + noactivate; NO toolwindow -> real taskbar entry. */
+    SetWindowLong(h, GWL_EXSTYLE,
+        GetWindowLong(h, GWL_EXSTYLE)
+        | WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE);
+    SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+    SetWindowPos(h, HWND_TOPMOST, 50, 50, 0, 0,
+                 SWP_NOSIZE | SWP_SHOWWINDOW);
+
+    /* Install activation subclass once. */
+    if (!g_orig_wndproc) {
+        g_orig_wndproc = (WNDPROC)SetWindowLongPtr(h, GWLP_WNDPROC,
+                                                   (LONG_PTR)orb_subclass_proc);
+    }
+}
+
+void plat_window_set_rect(struct GLFWwindow* w, int x, int y, int width, int height) {
+    HWND h = glfwGetWin32Window(w);
+    /* Position and size together: SWP_NOMOVE/SWP_NOSIZE both omitted, so
+     * the window manager applies one change and there is no frame in which
+     * the window is the new size at the old place. */
+    SetWindowPos(h, HWND_TOPMOST, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+void plat_window_move(struct GLFWwindow* w, int x, int y) {
+    SetWindowPos(glfwGetWin32Window(w), HWND_TOPMOST, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void plat_window_topmost_refresh(struct GLFWwindow* w) {
+    SetWindowPos(glfwGetWin32Window(w), HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+/* Punch WM_DROPFILES / WM_COPYDATA / WM_COPYGLOBALDATA through the UIPI
+ * message filter so drag-drop from a normal-integrity Explorer still works
+ * when we are running elevated. Resolved dynamically: the API is Win7+ and
+ * some toolchain headers omit it. */
+void plat_window_allow_drops(struct GLFWwindow* w) {
+    if (!plat_process_is_elevated()) return;   /* nothing filtered when medium */
+    HWND h = glfwGetWin32Window(w);
+    typedef BOOL (WINAPI *PFN_CWMFEx)(HWND, UINT, DWORD, void*);
+    HMODULE u32 = GetModuleHandleA("user32.dll");
+    if (!u32) return;
+    PFN_CWMFEx fn = (PFN_CWMFEx)(void*)GetProcAddress(u32, "ChangeWindowMessageFilterEx");
+    if (!fn) return;
+    const DWORD MSGFLT_ALLOW_ = 1;
+    fn(h, WM_DROPFILES,        MSGFLT_ALLOW_, NULL);
+    fn(h, WM_COPYDATA,         MSGFLT_ALLOW_, NULL);
+    fn(h, 0x0049 /* WM_COPYGLOBALDATA */, MSGFLT_ALLOW_, NULL);
+}
+
+/* SetWindowRgn is the Win32 answer to "my object is round but my window is
+ * square": the region defines what the window IS, for painting and for hit
+ * testing alike, so clicks in the corners go to whatever is underneath. */
+void plat_window_set_circular(struct GLFWwindow* w, int diameter) {
+    HWND h = glfwGetWin32Window(w);
+    if (diameter <= 0) {
+        SetWindowRgn(h, NULL, TRUE);      /* back to a plain rectangle */
+        return;
+    }
+    HRGN rgn = CreateEllipticRgn(0, 0, diameter + 1, diameter + 1);
+    if (!rgn) return;
+    /* The window takes ownership of the region -- do not delete it here. */
+    SetWindowRgn(h, rgn, TRUE);
+}
+
+void plat_window_set_shape(struct GLFWwindow* w,
+                           int bx, int by, int diameter,
+                           int rx, int ry, int rw, int rh) {
+    HWND h = glfwGetWin32Window(w);
+    if (diameter <= 0) { SetWindowRgn(h, NULL, TRUE); return; }
+    HRGN rgn = CreateEllipticRgn(bx, by, bx + diameter + 1, by + diameter + 1);
+    if (!rgn) return;
+    if (rw > 0 && rh > 0) {
+        HRGN bar = CreateRectRgn(rx, ry, rx + rw, ry + rh);
+        if (bar) {
+            CombineRgn(rgn, rgn, bar, RGN_OR);
+            DeleteObject(bar);
+        }
+    }
+    SetWindowRgn(h, rgn, TRUE);   /* window owns the region now */
+}
+
+void plat_window_set_clickthrough(struct GLFWwindow* w, bool on) {
+    HWND h = glfwGetWin32Window(w);
+    LONG ex = GetWindowLong(h, GWL_EXSTYLE);
+    if (on) ex |=  WS_EX_TRANSPARENT;
+    else    ex &= ~WS_EX_TRANSPARENT;
+    SetWindowLong(h, GWL_EXSTYLE, ex);
+}
+
+void plat_window_load_icon(struct GLFWwindow* w) {
+    HWND h = glfwGetWin32Window(w);
+    HICON hOrb = (HICON)LoadImageA(GetModuleHandleA(NULL),
+                                   MAKEINTRESOURCEA(IDI_ORB),
+                                   IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+    if (hOrb) {
+        SendMessageA(h, WM_SETICON, ICON_BIG,   (LPARAM)hOrb);
+        SendMessageA(h, WM_SETICON, ICON_SMALL, (LPARAM)hOrb);
+    }
+}
+
+/* ---- pointing & focus ------------------------------------------------- */
+void plat_get_cursor(int* x, int* y) {
+    POINT p; GetCursorPos(&p);
+    *x = p.x; *y = p.y;
+}
+bool plat_left_button_down(void) {
+    return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+}
+void* plat_window_at_cursor(void) {
+    POINT p; GetCursorPos(&p);
+    HWND h = WindowFromPoint(p);
+    if (!h) return NULL;
+    HWND top = GetAncestor(h, GA_ROOT);
+    return top ? (void*)top : (void*)h;
+}
+void* plat_get_foreground_window(void) {
+    return (void*)GetForegroundWindow();
+}
+void* plat_get_orb_native_handle(struct GLFWwindow* w) {
+    return (void*)glfwGetWin32Window(w);
+}
+bool plat_handles_equal(void* a, void* b) { return a == b; }
+
+/* ---- capture ---------------------------------------------------------- */
+static uint8_t* capture_dc(HDC srcDC, int srcX, int srcY, int srcW, int srcH,
+                           int capW, int capH) {
+    HDC memDC = CreateCompatibleDC(srcDC);
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = capW;
+    bmi.bmiHeader.biHeight = -capH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* pixels = NULL;
+    HBITMAP dib = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &pixels, NULL, 0);
+    if (!dib) { DeleteDC(memDC); return NULL; }
+    HGDIOBJ oldBmp = SelectObject(memDC, dib);
+    SetStretchBltMode(memDC, HALFTONE);
+    StretchBlt(memDC, 0, 0, capW, capH, srcDC, srcX, srcY, srcW, srcH, SRCCOPY);
+    SelectObject(memDC, oldBmp);
+
+    int npix = capW * capH;
+    uint8_t* out = (uint8_t*)malloc(npix * 4);
+    if (!out) { DeleteObject(dib); DeleteDC(memDC); return NULL; }
+    uint8_t* src = (uint8_t*)pixels;
+    for (int i = 0; i < npix; i++) {
+        out[i*4 + 0] = src[i*4 + 2];   /* R <- B */
+        out[i*4 + 1] = src[i*4 + 1];   /* G */
+        out[i*4 + 2] = src[i*4 + 0];   /* B <- R */
+        out[i*4 + 3] = 255;
+    }
+    DeleteObject(dib);
+    DeleteDC(memDC);
+    return out;
+}
+
+/* PW_RENDERFULLCONTENT (Windows 8.1+): tells PrintWindow to composite the
+ * window's DirectComposition / hardware-accelerated surfaces into the DC,
+ * instead of returning stale cached bits. Without this flag, capturing
+ * Chrome/Firefox/Electron/games via BitBlt returns frozen frames. */
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+
+/* Detect a completely uniform (all one color) capture -- means the source
+ * refused to render, so we should retry via a different path. */
+static bool image_is_uniform(const uint8_t* rgba, int npix) {
+    if (npix < 2) return true;
+    uint32_t first = *(const uint32_t*)rgba;
+    for (int i = 1; i < npix; i++) {
+        if (*(const uint32_t*)(rgba + i*4) != first) return false;
+    }
+    return true;
+}
+
+uint8_t* plat_capture_window(void* handle, int capW, int capH,
+                             char* title_out, size_t title_size,
+                             int* src_w, int* src_h) {
+    HWND target = (HWND)handle;
+    if (!IsWindow(target)) return NULL;
+    RECT r; if (!GetClientRect(target, &r)) return NULL;
+    int sW = r.right - r.left, sH = r.bottom - r.top;
+    if (src_w) *src_w = sW;
+    if (src_h) *src_h = sH;
+    if (title_out && title_size > 0) {
+        title_out[0] = 0;
+        GetWindowTextA(target, title_out, (int)title_size - 1);
+    }
+    if (sW <= 0 || sH <= 0) return NULL;
+
+    /* UIPI: if the target runs at higher integrity than us, PrintWindow is
+     * blocked and returns black/stale bits. Reading the composited desktop
+     * is NOT blocked, so capture the window's screen rectangle instead.
+     * Cached per-HWND -- this is a per-frame hot path. */
+    {
+        static HWND s_cached_hwnd = NULL;
+        static bool s_cached_elev = false;
+        if (target != s_cached_hwnd) {
+            s_cached_hwnd = target;
+            s_cached_elev = plat_window_is_elevated(target);
+        }
+        if (s_cached_elev) {
+            RECT wr;
+            if (GetWindowRect(target, &wr)) {
+                return plat_capture_rect(wr.left, wr.top,
+                                         wr.right - wr.left,
+                                         wr.bottom - wr.top, capW, capH);
+            }
+        }
+    }
+
+    /* Strategy: build a DIB at native size, ask the window to PrintWindow
+     * itself into it (forcing GPU-composited windows to redraw), then
+     * resample to capW x capH.                                          */
+    HDC winDC = GetDC(target);
+    if (!winDC) return NULL;
+    HDC memDC = CreateCompatibleDC(winDC);
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = sW;
+    bmi.bmiHeader.biHeight = -sH;   /* top-down */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* nativePixels = NULL;
+    HBITMAP nativeDib = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS,
+                                         &nativePixels, NULL, 0);
+    if (!nativeDib) {
+        DeleteDC(memDC); ReleaseDC(target, winDC); return NULL;
+    }
+    HGDIOBJ oldNative = SelectObject(memDC, nativeDib);
+
+    BOOL pwOk = PrintWindow(target, memDC, PW_RENDERFULLCONTENT);
+    if (!pwOk) {
+        /* Older Windows / windows that don't support PrintWindow:
+         * fall back to BitBlt from the window's own DC.                */
+        BitBlt(memDC, 0, 0, sW, sH, winDC, 0, 0, SRCCOPY);
+    }
+
+    /* Now resample nativePixels (BGRA at sW x sH) into out (RGBA at capW x capH).
+     * We do a simple StretchBlt via a second memory DC.                */
+    HDC scaleDC = CreateCompatibleDC(winDC);
+    BITMAPINFO sbmi;
+    memset(&sbmi, 0, sizeof sbmi);
+    sbmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    sbmi.bmiHeader.biWidth = capW;
+    sbmi.bmiHeader.biHeight = -capH;
+    sbmi.bmiHeader.biPlanes = 1;
+    sbmi.bmiHeader.biBitCount = 32;
+    sbmi.bmiHeader.biCompression = BI_RGB;
+    void* scalePixels = NULL;
+    HBITMAP scaleDib = CreateDIBSection(scaleDC, &sbmi, DIB_RGB_COLORS,
+                                        &scalePixels, NULL, 0);
+    if (!scaleDib) {
+        SelectObject(memDC, oldNative); DeleteObject(nativeDib);
+        DeleteDC(memDC); DeleteDC(scaleDC); ReleaseDC(target, winDC);
+        return NULL;
+    }
+    HGDIOBJ oldScale = SelectObject(scaleDC, scaleDib);
+    SetStretchBltMode(scaleDC, HALFTONE);
+    StretchBlt(scaleDC, 0, 0, capW, capH, memDC, 0, 0, sW, sH, SRCCOPY);
+    SelectObject(scaleDC, oldScale);
+
+    int npix = capW * capH;
+    uint8_t* out = (uint8_t*)malloc(npix * 4);
+    if (!out) {
+        DeleteObject(scaleDib); SelectObject(memDC, oldNative);
+        DeleteObject(nativeDib); DeleteDC(memDC); DeleteDC(scaleDC);
+        ReleaseDC(target, winDC); return NULL;
+    }
+    uint8_t* src = (uint8_t*)scalePixels;
+    for (int i = 0; i < npix; i++) {
+        out[i*4 + 0] = src[i*4 + 2];   /* R <- B */
+        out[i*4 + 1] = src[i*4 + 1];   /* G */
+        out[i*4 + 2] = src[i*4 + 0];   /* B <- R */
+        out[i*4 + 3] = 255;
+    }
+    DeleteObject(scaleDib);
+    SelectObject(memDC, oldNative);
+    DeleteObject(nativeDib);
+    DeleteDC(memDC);
+    DeleteDC(scaleDC);
+    ReleaseDC(target, winDC);
+
+    /* Last-ditch: if PrintWindow returned all-one-color (some fullscreen
+     * DX apps ignore PW_RENDERFULLCONTENT), fall back to grabbing the
+     * screen rectangle where the window lives via GetDC(NULL).          */
+    if (image_is_uniform(out, npix)) {
+        RECT wr;
+        if (GetWindowRect(target, &wr)) {
+            uint8_t* alt = plat_capture_rect(wr.left, wr.top,
+                                             wr.right - wr.left,
+                                             wr.bottom - wr.top,
+                                             capW, capH);
+            if (alt) { free(out); return alt; }
+        }
+    }
+    return out;
+}
+
+uint8_t* plat_capture_rect(int x, int y, int w, int h, int capW, int capH) {
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) return NULL;
+    uint8_t* px = capture_dc(screenDC, x, y, w, h, capW, capH);
+    ReleaseDC(NULL, screenDC);
+    return px;
+}
+
+static PlatMonitor* g_enum_buf; static int g_enum_max, g_enum_n;
+static BOOL CALLBACK enum_cb(HMONITOR mon, HDC dc, LPRECT rect, LPARAM lp) {
+    (void)dc; (void)lp;
+    if (g_enum_n >= g_enum_max) return FALSE;
+    PlatMonitor* m = &g_enum_buf[g_enum_n];
+    m->x = rect->left; m->y = rect->top;
+    m->w = rect->right - rect->left;
+    m->h = rect->bottom - rect->top;
+    snprintf(m->name, sizeof m->name, "Monitor %d  (%dx%d)",
+             g_enum_n + 1, m->w, m->h);
+    /* Stable identity: \\.\DISPLAY1 etc. Survives resolution changes. */
+    m->id[0] = 0;
+    MONITORINFOEXA mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (GetMonitorInfoA(mon, (MONITORINFO*)&mi))
+        snprintf(m->id, sizeof m->id, "%s", mi.szDevice);
+    if (!m->id[0]) snprintf(m->id, sizeof m->id, "idx%d", g_enum_n);
+    g_enum_n++;
+    return TRUE;
+}
+int plat_enum_monitors(PlatMonitor* out, int max) {
+    g_enum_buf = out; g_enum_max = max; g_enum_n = 0;
+    EnumDisplayMonitors(NULL, NULL, enum_cb, 0);
+    return g_enum_n;
+}
+
+/* ---- hotkeys ---------------------------------------------------------- */
+bool plat_register_hotkey(int id) {
+    if (id == PLAT_HK_F5)     return RegisterHotKey(NULL, HOTKEY_ID_F5,  MOD_NOREPEAT, VK_F5)     != 0;
+    if (id == PLAT_HK_ESCAPE) return RegisterHotKey(NULL, HOTKEY_ID_ESC, 0,            VK_ESCAPE) != 0;
+    if (id == PLAT_HK_F6)     return RegisterHotKey(NULL, HOTKEY_ID_F6,  MOD_NOREPEAT, VK_F6)     != 0;
+    if (id == PLAT_HK_F7)     return RegisterHotKey(NULL, HOTKEY_ID_F7,  MOD_NOREPEAT, VK_F7)     != 0;
+    if (id == PLAT_HK_F8)     return RegisterHotKey(NULL, HOTKEY_ID_F8,  MOD_NOREPEAT, VK_F8)     != 0;
+    if (id == PLAT_HK_F9)     return RegisterHotKey(NULL, HOTKEY_ID_F9,  MOD_NOREPEAT, VK_F9)     != 0;
+    if (id == PLAT_HK_F4)     return RegisterHotKey(NULL, HOTKEY_ID_F4,  MOD_NOREPEAT, VK_F4)     != 0;
+    /* PrintScreen is bound to Snipping Tool on Windows 11 out of the box,
+     * so this can legitimately fail. The caller reports that honestly
+     * rather than leaving a checkbox that silently will not tick. */
+    if (id == PLAT_HK_PRTSC)  return RegisterHotKey(NULL, HOTKEY_ID_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT) != 0;
+    if (id == PLAT_HK_F8)     return RegisterHotKey(NULL, HOTKEY_ID_F8,  MOD_NOREPEAT, VK_F8)     != 0;
+    return false;
+}
+void plat_unregister_hotkey(int id) {
+    if (id == PLAT_HK_F5)     UnregisterHotKey(NULL, HOTKEY_ID_F5);
+    if (id == PLAT_HK_ESCAPE) UnregisterHotKey(NULL, HOTKEY_ID_ESC);
+    if (id == PLAT_HK_F6)     UnregisterHotKey(NULL, HOTKEY_ID_F6);
+    if (id == PLAT_HK_F7)     UnregisterHotKey(NULL, HOTKEY_ID_F7);
+    if (id == PLAT_HK_F8)     UnregisterHotKey(NULL, HOTKEY_ID_F8);
+    if (id == PLAT_HK_F9)     UnregisterHotKey(NULL, HOTKEY_ID_F9);
+    if (id == PLAT_HK_F4)     UnregisterHotKey(NULL, HOTKEY_ID_F4);
+    if (id == PLAT_HK_PRTSC)  UnregisterHotKey(NULL, HOTKEY_ID_PRTSC);
+    if (id == PLAT_HK_F8)     UnregisterHotKey(NULL, HOTKEY_ID_F8);
+}
+int plat_poll_hotkey(void) {
+    int fired = 0;
+    MSG msg;
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_HOTKEY) {
+            if      (msg.wParam == HOTKEY_ID_F5)  fired = PLAT_HK_F5;
+            else if (msg.wParam == HOTKEY_ID_ESC) fired = PLAT_HK_ESCAPE;
+            else if (msg.wParam == HOTKEY_ID_F6)  fired = PLAT_HK_F6;
+            else if (msg.wParam == HOTKEY_ID_F7)  fired = PLAT_HK_F7;
+            else if (msg.wParam == HOTKEY_ID_F8)  fired = PLAT_HK_F8;
+            else if (msg.wParam == HOTKEY_ID_F9)  fired = PLAT_HK_F9;
+            else if (msg.wParam == HOTKEY_ID_F4)  fired = PLAT_HK_F4;
+            else if (msg.wParam == HOTKEY_ID_PRTSC) fired = PLAT_HK_PRTSC;
+            else if (msg.wParam == HOTKEY_ID_F8)  fired = PLAT_HK_F8;
+        }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return fired;
+}
+
+/* ---- right-click menu ------------------------------------------------- */
+/* The menu is grouped by what you are making -- GIF, then MP4, then camera
+ * -- with each action's key right-aligned via \t. Capture toggles live in
+ * their own submenu rather than doubling up on the action items: a row that
+ * both performs an action AND carries a checkbox cannot say which one a
+ * click means. */
+int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
+                   const PlatMonitor* monitors, int nmonitors) {
+    HWND h = glfwGetWin32Window(w);
+    HMENU root = CreatePopupMenu();
+
+    /* --- monitor submenus, one per output format --- */
+    HMENU gifMon = CreatePopupMenu();
+    HMENU vidMon = CreatePopupMenu();
+    for (int i = 0; i < nmonitors; i++) {
+        AppendMenuA(gifMon, MF_STRING, PLAT_MENU_MONITOR_BASE  + (UINT)i, monitors[i].name);
+        AppendMenuA(vidMon, MF_STRING, PLAT_MENU_VMONITOR_BASE + (UINT)i, monitors[i].name);
+    }
+
+    /* --- screenshot: the quickest path of all --- */
+    AppendMenuA(root, MF_STRING, PLAT_MENU_SHOT_REGION, "Screenshot: region\tF4 / PrtSc");
+    AppendMenuA(root, MF_STRING, PLAT_MENU_SHOT_WINDOW, "Screenshot: window");
+    AppendMenuA(root, MF_SEPARATOR, 0, NULL);
+
+    /* --- GIF --- */
+    AppendMenuA(root, MF_STRING, PLAT_MENU_RECORD_GIF,    "GIF: record window\tF5");
+    AppendMenuA(root, MF_STRING, PLAT_MENU_RECORD_REGION, "GIF: record region\tF6");
+    AppendMenuA(root, MF_POPUP, (UINT_PTR)gifMon,         "GIF: record monitor");
+    AppendMenuA(root, MF_SEPARATOR, 0, NULL);
+
+    /* --- MP4 --- */
+    AppendMenuA(root, MF_STRING, PLAT_MENU_RECORD_VIDEO,     "MP4: record window\tF7");
+    AppendMenuA(root, MF_STRING, PLAT_MENU_RECORD_VIDEO_RGN, "MP4: record region\tF8");
+    AppendMenuA(root, MF_POPUP, (UINT_PTR)vidMon,            "MP4: record monitor");
+    AppendMenuA(root, MF_SEPARATOR, 0, NULL);
+
+    /* --- camera + sound --- */
+    {
+        char cams[PLAT_MAX_CAMERAS][64];
+        int ncam = plat_camera_list(cams, PLAT_MAX_CAMERAS);
+        if (ncam > 0) {
+            HMENU camMenu = CreatePopupMenu();
+            for (int i = 0; i < ncam; i++) {
+                /* Number identical devices so they can be told apart.
+                 *
+                 * There is deliberately NO "in use" marker here. Windows
+                 * Media Foundation SHARES cameras between applications --
+                 * verified by holding one open and streaming in one process
+                 * while a second opened the same device successfully -- so
+                 * "in use" is not a state that exists to be shown, and a
+                 * marker that can never appear is worse than none. It also
+                 * cost an activate/release per camera every time the menu
+                 * opened. */
+                char row[96];
+                bool dup = false;
+                for (int j = 0; j < ncam && !dup; j++)
+                    if (j != i && strcmp(cams[j], cams[i]) == 0) dup = true;
+                if (dup) snprintf(row, sizeof row, "%s  (%d)", cams[i], i + 1);
+                else     snprintf(row, sizeof row, "%s", cams[i]);
+                AppendMenuA(camMenu, MF_STRING,
+                            PLAT_MENU_CAMERA_BASE + (UINT)i, row);
+            }
+            AppendMenuA(root, MF_POPUP, (UINT_PTR)camMenu, "Camera: record\tF9");
+        } else {
+            AppendMenuA(root, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                        "Camera: none found");
+        }
+    }
+    {
+        static const char* AUDN[4] = { "No sound", "System sound",
+                                       "Microphone", "System + microphone" };
+        HMENU audMenu = CreatePopupMenu();
+        for (int i = 0; i < 4; i++)
+            AppendMenuA(audMenu,
+                        MF_STRING | (st->audio_src == i ? MF_CHECKED : MF_UNCHECKED),
+                        PLAT_MENU_AUDIO_BASE + (UINT)i, AUDN[i]);
+        AppendMenuA(root, MF_POPUP, (UINT_PTR)audMenu, "Sound source");
+    }
+    {
+        /* Which format the double-click gesture arms for. Radio-style:
+         * one gesture cannot mean two things at once. */
+        HMENU dblMenu = CreatePopupMenu();
+        AppendMenuA(dblMenu, MF_STRING | (st->dbl_video ? MF_UNCHECKED : MF_CHECKED),
+                    PLAT_MENU_DBL_GIF, "Double-click arms GIF");
+        AppendMenuA(dblMenu, MF_STRING | (st->dbl_video ? MF_CHECKED : MF_UNCHECKED),
+                    PLAT_MENU_DBL_MP4, "Double-click arms MP4");
+        AppendMenuA(root, MF_POPUP, (UINT_PTR)dblMenu, "Double-click gesture");
+    }
+    AppendMenuA(root, MF_SEPARATOR, 0, NULL);
+
+    /* --- hotkey capture, one checkbox per key ---
+     * Releasing a key hands it back to whatever else wants it, which is the
+     * whole point: F5 in particular is Refresh almost everywhere. */
+    {
+        static const char* HKN[PLAT_HK_COUNT] = {
+            "F5\tGIF window",
+            "F6\tGIF region",
+            "F7\tMP4 window",
+            "F8\tMP4 region",
+            "F9\tCamera",
+            "F4\tScreenshot",
+            "PrtSc\tScreenshot"
+        };
+        HMENU hkMenu = CreatePopupMenu();
+        for (int i = 0; i < PLAT_HK_COUNT; i++)
+            AppendMenuA(hkMenu,
+                        MF_STRING | (st->hotkey_on[i] ? MF_CHECKED : MF_UNCHECKED),
+                        PLAT_MENU_HOTKEY_BASE + (UINT)i, HKN[i]);
+        AppendMenuA(root, MF_POPUP, (UINT_PTR)hkMenu, "Hotkeys captured");
+    }
+
+    /* --- output behaviour --- */
+    AppendMenuA(root, MF_STRING | (st->auto_open ? MF_CHECKED : MF_UNCHECKED),
+                PLAT_MENU_TOGGLE_AUTOOPEN, "Open folder after saving");
+    AppendMenuA(root, MF_STRING | (st->auto_clip ? MF_CHECKED : MF_UNCHECKED),
+                PLAT_MENU_TOGGLE_CLIP,     "Copy file to clipboard");
+    AppendMenuA(root, MF_STRING | (st->tray_only ? MF_CHECKED : MF_UNCHECKED),
+                PLAT_MENU_TOGGLE_TRAY,     "Tray icon only");
+    AppendMenuA(root, MF_STRING, PLAT_MENU_HIDE_ORB,
+                "Hide orb (tray icon brings it back)");
+    AppendMenuA(root, MF_STRING | (st->run_at_startup ? MF_CHECKED : 0),
+                PLAT_MENU_RUN_AT_STARTUP, "Run at startup");
+    AppendMenuA(root, MF_SEPARATOR, 0, NULL);
+
+    /* --- files + help --- */
+    AppendMenuA(root, MF_STRING, PLAT_MENU_OPEN_EDITOR,   "Open image or GIF...");
+    AppendMenuA(root, MF_STRING, PLAT_MENU_HELP,          "Help\tF1");
+    AppendMenuA(root, MF_STRING, PLAT_MENU_EDIT_SETTINGS, "Edit settings file...");
+    if (plat_process_is_elevated()) {
+        AppendMenuA(root, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                    "Running as administrator");
+    } else {
+        AppendMenuA(root, MF_STRING, PLAT_MENU_RESTART_ADMIN,
+                    "Restart as administrator...");
+    }
+    AppendMenuA(root, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(root, MF_STRING, PLAT_MENU_QUIT, "Quit");
+
+    POINT p; GetCursorPos(&p);
+
+    /* TrackPopupMenu needs a foreground window or the menu will not dismiss
+     * when the user clicks away -- but that activation is exactly what makes
+     * the shell restore the taskbar button. Do it, then put the style back. */
+    SetForegroundWindow(h);
+    int cmd = TrackPopupMenu(root,
+                             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN,
+                             p.x, p.y, 0, h, NULL);
+    DestroyMenu(root);
+
+    /* The documented incantation: without this the menu can leave the window
+     * in a half-activated state and the next click is swallowed. */
+    PostMessage(h, WM_NULL, 0, 0);
+
+    /* Re-assert. apply_taskbar_button() returns immediately when the style is
+     * already right, so this costs nothing in the common case and only does
+     * the hide/show cycle when the shell actually took the button back. */
+    apply_taskbar_button(h, st && st->tray_only);
+
+    return cmd;
+}
+
+/* ---- image helpers: borrow the shell's decoders + thumbnail cache ------ */
+
+/* IShellItemImageFactory {BCC18B79-BA16-442F-80C4-8A59C30C463B}.
+ * Defined locally rather than pulled from libuuid so the link line stays
+ * the same across MinGW installs. */
+static const GUID IID_IShellItemImageFactory_ =
+    { 0xbcc18b79, 0xba16, 0x442f,
+      { 0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b } };
+
+/* Ask the shell for a file's thumbnail. This is the same bitmap Explorer
+ * shows, pulled from the same cache, which means:
+ *   - every registered codec works (WebP/HEIC/RAW/PSD/video posters)
+ *   - already-browsed folders return essentially instantly
+ * Returns malloc'd RGBA, or NULL if the shell cannot produce one. */
+uint8_t* plat_shell_thumbnail(const char* path, int want_px, int* out_w, int* out_h) {
+    if (!path || !*path) return NULL;
+
+    /* IShellItemImageFactory is COM; make sure this thread is initialized. */
+    HRESULT hrco = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool we_init = SUCCEEDED(hrco);
+
+    /* SHCreateItemFromParsingName only accepts backslash-separated paths --
+     * a forward slash makes it fail outright, which is easy to mistake for
+     * "no thumbnail available". Normalize first.
+     * Paths arrive as UTF-8 (GLFW's drop callback); CP_ACP would mangle
+     * anything non-ASCII, e.g. the em-dash in a Firefox screenshot name. */
+    char norm[MAX_PATH];
+    size_t plen = strlen(path);
+    if (plen >= sizeof norm) plen = sizeof norm - 1;
+    for (size_t i = 0; i < plen; i++) norm[i] = (path[i] == '/') ? '\\' : path[i];
+    norm[plen] = 0;
+
+    wchar_t wpath[MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, norm, -1, wpath, MAX_PATH) == 0) {
+        if (we_init) CoUninitialize();
+        return NULL;
+    }
+
+    IShellItemImageFactory* factory = NULL;
+    HRESULT hr = SHCreateItemFromParsingName(wpath, NULL,
+                                             &IID_IShellItemImageFactory_,
+                                             (void**)&factory);
+    if (FAILED(hr) || !factory) {
+        if (we_init) CoUninitialize();
+        return NULL;
+    }
+
+    SIZE sz; sz.cx = want_px; sz.cy = want_px;
+    HBITMAP hbm = NULL;
+    /* BIGGERSIZEOK lets the shell hand back its cached tile rather than
+     * re-rendering to our exact request -- much faster, and we scale. */
+    hr = factory->lpVtbl->GetImage(factory, sz,
+                                   SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY,
+                                   &hbm);
+    if (FAILED(hr) || !hbm) {
+        /* Retry allowing an icon, so unknown types still show something. */
+        hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK, &hbm);
+    }
+    factory->lpVtbl->Release(factory);
+
+    if (FAILED(hr) || !hbm) {
+        if (we_init) CoUninitialize();
+        return NULL;
+    }
+
+    BITMAP bm;
+    if (!GetObject(hbm, sizeof bm, &bm)) {
+        DeleteObject(hbm);
+        if (we_init) CoUninitialize();
+        return NULL;
+    }
+    int w = bm.bmWidth, h = bm.bmHeight;
+
+    /* Pull the pixels out as a top-down 32bpp DIB. */
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;          /* top-down */
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    uint8_t* raw = (uint8_t*)malloc((size_t)w * h * 4);
+    if (!raw) {
+        DeleteObject(hbm);
+        if (we_init) CoUninitialize();
+        return NULL;
+    }
+    HDC dc = GetDC(NULL);
+    int got = GetDIBits(dc, hbm, 0, h, raw, &bi, DIB_RGB_COLORS);
+    ReleaseDC(NULL, dc);
+    DeleteObject(hbm);
+    if (we_init) CoUninitialize();
+
+    if (got == 0) { free(raw); return NULL; }
+
+    /* BGRA -> RGBA. Shell thumbnails may carry premultiplied alpha; composite
+     * onto black so transparent PNGs do not come back as garbage. */
+    for (int i = 0; i < w * h; i++) {
+        uint8_t b = raw[i*4 + 0], g_ = raw[i*4 + 1], r = raw[i*4 + 2], a = raw[i*4 + 3];
+        if (a == 0) {
+            /* Fully transparent, or an alpha-less source the shell zero-filled. */
+            raw[i*4 + 0] = r; raw[i*4 + 1] = g_; raw[i*4 + 2] = b; raw[i*4 + 3] = 255;
+        } else {
+            raw[i*4 + 0] = r; raw[i*4 + 1] = g_; raw[i*4 + 2] = b; raw[i*4 + 3] = 255;
+        }
+    }
+    *out_w = w; *out_h = h;
+    return raw;
+}
+
+static bool is_image_ext_(const char* name) {
+    const char* dot = strrchr(name, '.');
+    if (!dot) return false;
+    static const char* exts[] = {
+        ".jpg",".jpeg",".png",".gif",".bmp",".tga",".webp",".tif",".tiff",
+        ".heic",".avif",".jfif",".psd",".ico", NULL
+    };
+    for (int i = 0; exts[i]; i++) if (_stricmp(dot, exts[i]) == 0) return true;
+    return false;
+}
+
+static int cmp_str_ci_(const void* a, const void* b) {
+    return _stricmp(*(const char**)a, *(const char**)b);
+}
+
+int plat_list_sibling_images(const char* path, char** out, int max, int* out_self) {
+    if (out_self) *out_self = 0;
+    if (!path || !*path || max <= 0) return 0;
+
+    /* UTF-8 in, UTF-8 out, wide in the middle -- FindFirstFileA would drop
+     * or mangle any filename containing non-ASCII. */
+    wchar_t wpath[MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) == 0) return 0;
+
+    wchar_t wdir[MAX_PATH];
+    wcsncpy(wdir, wpath, MAX_PATH - 1); wdir[MAX_PATH - 1] = 0;
+    wchar_t* wslash = wcsrchr(wdir, L'\\');
+    wchar_t* wfs    = wcsrchr(wdir, L'/');
+    if (wfs > wslash) wslash = wfs;
+    const wchar_t* wself = wpath;
+    if (wslash) { *wslash = 0; wself = wpath + (wslash - wdir) + 1; }
+    else        { wcscpy(wdir, L"."); }
+
+    wchar_t wpattern[MAX_PATH];
+    _snwprintf(wpattern, MAX_PATH, L"%s\\*", wdir);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int n = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char nameU8[MAX_PATH * 3];
+        if (WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
+                                nameU8, sizeof nameU8, NULL, NULL) == 0) continue;
+        if (!is_image_ext_(nameU8)) continue;
+        if (n >= max) break;
+
+        wchar_t wfull[MAX_PATH];
+        _snwprintf(wfull, MAX_PATH, L"%s\\%s", wdir, fd.cFileName);
+        char fullU8[MAX_PATH * 3];
+        if (WideCharToMultiByte(CP_UTF8, 0, wfull, -1,
+                                fullU8, sizeof fullU8, NULL, NULL) == 0) continue;
+        char* full = _strdup(fullU8);
+        if (!full) break;
+        out[n++] = full;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    qsort(out, (size_t)n, sizeof(char*), cmp_str_ci_);
+
+    /* Locate the dropped file in the sorted list (compare in UTF-8). */
+    if (out_self) {
+        char selfU8[MAX_PATH * 3];
+        if (WideCharToMultiByte(CP_UTF8, 0, wself, -1,
+                                selfU8, sizeof selfU8, NULL, NULL) != 0) {
+            for (int i = 0; i < n; i++) {
+                const char* base = strrchr(out[i], '\\');
+                base = base ? base + 1 : out[i];
+                if (_stricmp(base, selfU8) == 0) { *out_self = i; break; }
+            }
+        }
+    }
+    return n;
+}
+
+/* ---- what this machine can decode ------------------------------------
+ * Windows Imaging Component knows every registered decoder, which on a
+ * stock Windows 11 box is ~14 codecs covering ~60 extensions -- including
+ * HEIC/AVIF and the whole camera-RAW family. Asking WIC beats hardcoding a
+ * list that goes stale the moment someone installs a codec pack. */
+
+static const GUID CLSID_WICImagingFactory_ =
+  {0xCACAF262,0x9370,0x4615,{0xA1,0x3B,0x9F,0x55,0x39,0xDA,0x4C,0x0A}};
+static const GUID IID_IWICImagingFactory_ =
+  {0xEC5EC8A9,0xC395,0x4314,{0x9C,0x77,0x54,0xD7,0xA9,0x35,0xFF,0x70}};
+static const GUID IID_IWICBitmapCodecInfo_ =
+  {0xE87A44C4,0xB76E,0x4C47,{0x8B,0x09,0x29,0x8E,0xB1,0x2A,0x27,0x14}};
+
+int plat_list_image_extensions(char* out, size_t sz) {
+    if (!out || sz == 0) return 0;
+    out[0] = 0;
+
+    HRESULT hrco = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool we_init = SUCCEEDED(hrco);
+
+    IWICImagingFactory* fac = NULL;
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory_, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IWICImagingFactory_, (void**)&fac)) || !fac) {
+        if (we_init) CoUninitialize();
+        return 0;
+    }
+    IEnumUnknown* en = NULL;
+    if (FAILED(IWICImagingFactory_CreateComponentEnumerator(
+            fac, WICDecoder, WICComponentEnumerateDefault, &en)) || !en) {
+        IWICImagingFactory_Release(fac);
+        if (we_init) CoUninitialize();
+        return 0;
+    }
+
+    int count = 0;
+    IUnknown* unk = NULL;
+    ULONG got = 0;
+    while (IEnumUnknown_Next(en, 1, &unk, &got) == S_OK && got) {
+        IWICBitmapCodecInfo* ci = NULL;
+        if (SUCCEEDED(IUnknown_QueryInterface(unk, &IID_IWICBitmapCodecInfo_, (void**)&ci))) {
+            WCHAR wext[1024] = {0};
+            UINT len = 0;
+            if (SUCCEEDED(IWICBitmapCodecInfo_GetFileExtensions(ci, 1024, wext, &len))) {
+                char ext[2048];
+                if (WideCharToMultiByte(CP_UTF8, 0, wext, -1, ext, sizeof ext, NULL, NULL)) {
+                    /* Lowercase, then append each ".xxx" we do not already have. */
+                    for (char* c = ext; *c; c++)
+                        if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+                    char* tok = strtok(ext, ",");
+                    while (tok) {
+                        while (*tok == ' ') tok++;
+                        if (*tok == '.') {
+                            char probe[40];
+                            snprintf(probe, sizeof probe, "%s,", tok);
+                            if (!strstr(out, probe)) {
+                                size_t cur = strlen(out);
+                                if (cur + strlen(probe) + 1 < sz) {
+                                    strcat(out, probe);
+                                    count++;
+                                }
+                            }
+                        }
+                        tok = strtok(NULL, ",");
+                    }
+                }
+            }
+            IWICBitmapCodecInfo_Release(ci);
+        }
+        IUnknown_Release(unk);
+    }
+    IEnumUnknown_Release(en);
+    IWICImagingFactory_Release(fac);
+    if (we_init) CoUninitialize();
+    return count;
+}
+
+/* ---- open-file dialog + default handler ------------------------------- */
+
+bool plat_open_file_dialog(char* out, size_t out_sz) {
+    if (!out || out_sz < MAX_PATH) return false;
+    char buf[MAX_PATH]; buf[0] = 0;
+
+    OPENFILENAMEA ofn;
+    memset(&ofn, 0, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner   = NULL;
+    ofn.lpstrFilter =
+        "Images and GIFs\0*.gif;*.jpg;*.jpeg;*.png;*.bmp;*.tga;*.psd;*.webp;*.tif;*.tiff\0"
+        "GIF\0*.gif\0"
+        "All files\0*.*\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = sizeof buf;
+    ofn.lpstrTitle  = "Open in ORB_Recorder";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+                    | OFN_EXPLORER;
+
+    /* Start in Pictures\GIF, which is where recordings land. */
+    char initial[MAX_PATH];
+    plat_get_output_dir(initial, sizeof initial);
+    ofn.lpstrInitialDir = initial;
+
+    if (!GetOpenFileNameA(&ofn)) return false;   /* cancelled */
+    snprintf(out, out_sz, "%s", buf);
+    return true;
+}
+
+void plat_open_with_default_app(const char* path) {
+    char norm[MAX_PATH];
+    size_t n = strlen(path);
+    if (n >= sizeof norm) n = sizeof norm - 1;
+    for (size_t i = 0; i < n; i++) norm[i] = (path[i] == '/') ? '\\' : path[i];
+    norm[n] = 0;
+    ShellExecuteA(NULL, "open", norm, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* ---- reveal file ------------------------------------------------------
+ * Explorer /select requires backslashes -- forward slashes silently no-op.
+ * Also ShellExecute needs COM initialized on the calling thread; when we
+ * hop in here from a background thread the thread trampoline handles it.
+ */
+void plat_open_folder_select(const char* file_path) {
+    char norm[MAX_PATH];
+    size_t n = strlen(file_path);
+    if (n >= sizeof norm) n = sizeof norm - 1;
+    for (size_t i = 0; i < n; i++) norm[i] = (file_path[i] == '/') ? '\\' : file_path[i];
+    norm[n] = 0;
+
+    /* SHOpenFolderAndSelectItems is the API Explorer itself uses. Unlike
+     * `explorer.exe /select,path`, which spawns a FRESH window every single
+     * time, this reuses a window already showing that folder -- it just
+     * raises it and moves the selection to the new file. After a dozen
+     * recordings that is the difference between one window and a dozen. */
+    HRESULT hrco = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool we_init = SUCCEEDED(hrco);
+
+    bool ok = false;
+    PIDLIST_ABSOLUTE pidl = ILCreateFromPathA(norm);
+    if (pidl) {
+        ok = SUCCEEDED(SHOpenFolderAndSelectItems(pidl, 0, NULL, 0));
+        ILFree(pidl);
+    }
+    if (we_init) CoUninitialize();
+
+    if (!ok) {
+        /* Fall back to the blunt instrument if the shell refused. */
+        char arg[MAX_PATH + 32];
+        snprintf(arg, sizeof arg, "/select,\"%s\"", norm);
+        ShellExecuteA(NULL, "open", "explorer.exe", arg, NULL, SW_SHOWNORMAL);
+    }
+}
+
+/* Put the picture itself on the clipboard as CF_DIB, which is what a chat
+ * box or word processor pastes. plat_clipboard_copy_file() puts a FILE on
+ * the clipboard (CF_HDROP) -- different format, different paste behaviour,
+ * and both are worth having. */
+void plat_clipboard_copy_image(const uint8_t* rgba, int w, int h) {
+    if (!rgba || w <= 0 || h <= 0) return;
+
+    size_t px_bytes = (size_t)w * h * 4;
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + px_bytes);
+    if (!hg) return;
+    void* mem = GlobalLock(hg);
+    if (!mem) { GlobalFree(hg); return; }
+
+    BITMAPINFOHEADER* bi = (BITMAPINFOHEADER*)mem;
+    memset(bi, 0, sizeof *bi);
+    bi->biSize        = sizeof(BITMAPINFOHEADER);
+    bi->biWidth       = w;
+    bi->biHeight      = h;          /* positive: bottom-up, as CF_DIB expects */
+    bi->biPlanes      = 1;
+    bi->biBitCount    = 32;
+    bi->biCompression = BI_RGB;
+    bi->biSizeImage   = (DWORD)px_bytes;
+
+    uint8_t* dst = (uint8_t*)mem + sizeof(BITMAPINFOHEADER);
+    for (int y = 0; y < h; y++) {
+        const uint8_t* srow = rgba + (size_t)y * w * 4;
+        uint8_t* drow = dst + (size_t)(h - 1 - y) * w * 4;   /* flip */
+        for (int x = 0; x < w; x++) {
+            drow[x*4 + 0] = srow[x*4 + 2];   /* B */
+            drow[x*4 + 1] = srow[x*4 + 1];   /* G */
+            drow[x*4 + 2] = srow[x*4 + 0];   /* R */
+            drow[x*4 + 3] = 255;
+        }
+    }
+    GlobalUnlock(hg);
+
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_DIB, hg);   /* clipboard owns hg now */
+        CloseClipboard();
+    } else {
+        GlobalFree(hg);
+    }
+}
+
+/* ---- 2D fallback painting ---------------------------------------------
+ * GDI, double-buffered into a memory bitmap so the orb never flickers.
+ * The window's region (set elsewhere) is what makes this round -- painting
+ * a rectangle inside a circular region yields a circle, which is why this
+ * needs no alpha channel and therefore no driver support beyond a DC. */
+void plat_draw_orb_2d(struct GLFWwindow* w, int win_size, int orb_size,
+                      unsigned char cr, unsigned char cg, unsigned char cb) {
+    HWND hwnd = glfwGetWin32Window(w);
+    if (!hwnd) return;
+
+    HDC dc = GetDC(hwnd);
+    if (!dc) return;
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, win_size, win_size);
+    HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
+
+    /* Backdrop. Clipped away outside the region, so it only shows inside
+     * the orb's circle -- it reads as the dark shell the 3D cage has. */
+    RECT full = { 0, 0, win_size, win_size };
+    HBRUSH back = CreateSolidBrush(RGB(24, 24, 28));
+    FillRect(mem, &full, back);
+    DeleteObject(back);
+
+    int cx = win_size / 2, cy = win_size / 2;
+    int r  = orb_size / 2;
+
+    /* Cage: a light ring at the orb's full radius. */
+    HPEN   ring = CreatePen(PS_SOLID, 2, RGB(200, 200, 210));
+    HBRUSH hollow = (HBRUSH)GetStockObject(NULL_BRUSH);
+    HPEN   oldpen = (HPEN)SelectObject(mem, ring);
+    HBRUSH oldbr  = (HBRUSH)SelectObject(mem, hollow);
+    Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
+
+    /* Core: filled, at 62% of the radius, in the state colour. Same job the
+     * 3D core does -- colour is the state, and that must survive. */
+    int cr2 = (r * 62) / 100;
+    HBRUSH core = CreateSolidBrush(RGB(cr, cg, cb));
+    HPEN   corepen = CreatePen(PS_SOLID, 1, RGB(cr, cg, cb));
+    SelectObject(mem, core);
+    SelectObject(mem, corepen);
+    Ellipse(mem, cx - cr2, cy - cr2, cx + cr2, cy + cr2);
+
+    SelectObject(mem, oldpen);
+    SelectObject(mem, oldbr);
+    DeleteObject(ring);
+    DeleteObject(core);
+    DeleteObject(corepen);
+
+    BitBlt(dc, 0, 0, win_size, win_size, mem, 0, 0, SRCCOPY);
+
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(hwnd, dc);
+}
+
+/* ---- single instance --------------------------------------------------
+ * A named kernel mutex: ownership is tracked by the kernel and released
+ * automatically however the process dies, so there is no stale lock file and
+ * no PID to probe.
+ *
+ * This exists because a second copy cannot take the global hotkeys -- the
+ * first already owns them -- so it starts with every capture key dead and a
+ * menu full of unchecked boxes, which reads as a broken install rather than
+ * a duplicate. */
+bool plat_single_instance(void) {
+    static HANDLE held = NULL;
+    if (held) return true;
+    SetLastError(0);
+    held = CreateMutexA(NULL, TRUE, "Local\\324x_ORB_Recorder_single");
+    if (!held) return true;                 /* cannot tell -- do not block */
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(held);
+        held = NULL;
+        return false;
+    }
+    return true;
+}
+
+void plat_window_set_visible(struct GLFWwindow* w, bool visible) {
+    HWND h = glfwGetWin32Window(w);
+    ShowWindow(h, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    if (visible)
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+bool plat_taskbar_button_enforce(struct GLFWwindow* w, bool hidden) {
+    return apply_taskbar_button(glfwGetWin32Window(w), hidden);
+}
+
+/* ---- run at login -----------------------------------------------------
+ * HKCU\Software\Microsoft\Windows\CurrentVersion\Run. Per-user, needs no
+ * elevation, and is the same entry Settings > Startup Apps shows -- so the
+ * user can turn it off where they would expect to.
+ *
+ * This is what makes "no installer" honest: copy the exe anywhere, run it,
+ * tick the box. The path is re-read from the running module each time it is
+ * enabled, so moving the exe and re-ticking repairs the entry. */
+
+#define ORB_RUN_KEY   "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define ORB_RUN_NAME  "ORB_Recorder"
+
+bool plat_get_run_at_startup(void) {
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, ORB_RUN_KEY, 0, KEY_QUERY_VALUE, &k)
+        != ERROR_SUCCESS) return false;
+    char buf[MAX_PATH * 2];
+    DWORD sz = sizeof buf, type = 0;
+    LONG r = RegQueryValueExA(k, ORB_RUN_NAME, NULL, &type, (LPBYTE)buf, &sz);
+    RegCloseKey(k);
+    if (r != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return false;
+
+    /* Present but pointing at a different copy counts as OFF -- otherwise the
+     * box reads ticked while a stale path launches something else. */
+    char exe[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, exe, MAX_PATH)) return true;
+    return strstr(buf, exe) != NULL;
+}
+
+bool plat_set_run_at_startup(bool on) {
+    HKEY k;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, ORB_RUN_KEY, 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return false;
+    bool ok;
+    if (on) {
+        char exe[MAX_PATH];
+        if (!GetModuleFileNameA(NULL, exe, MAX_PATH)) { RegCloseKey(k); return false; }
+        char quoted[MAX_PATH + 4];
+        snprintf(quoted, sizeof quoted, "\"%s\"", exe);   /* spaces in the path */
+        ok = RegSetValueExA(k, ORB_RUN_NAME, 0, REG_SZ,
+                            (const BYTE*)quoted, (DWORD)strlen(quoted) + 1)
+             == ERROR_SUCCESS;
+    } else {
+        LONG r = RegDeleteValueA(k, ORB_RUN_NAME);
+        ok = (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND);
+    }
+    RegCloseKey(k);
+    return ok;
+}
+
+/* ---- clipboard file-drop --------------------------------------------- */
+void plat_clipboard_copy_file(const char* file_path) {
+    /* Normalize slashes -- CF_HDROP expects backslash paths. */
+    char norm[MAX_PATH];
+    size_t n = strlen(file_path);
+    if (n >= sizeof norm - 1) n = sizeof norm - 2;
+    for (size_t i = 0; i < n; i++) norm[i] = (file_path[i] == '/') ? '\\' : file_path[i];
+    norm[n] = 0;
+
+    /* DROPFILES header + one null-terminated ANSI path + double-null terminator. */
+    size_t path_bytes = strlen(norm) + 1;
+    size_t total = sizeof(DROPFILES) + path_bytes + 1;   /* +1 for final null */
+    HGLOBAL hg = GlobalAlloc(GHND, total);
+    if (!hg) return;
+    DROPFILES* df = (DROPFILES*)GlobalLock(hg);
+    if (!df) { GlobalFree(hg); return; }
+    df->pFiles = sizeof(DROPFILES);
+    df->pt.x = 0; df->pt.y = 0;
+    df->fNC = FALSE;
+    df->fWide = FALSE;
+    char* dst = (char*)df + sizeof(DROPFILES);
+    memcpy(dst, norm, path_bytes);
+    dst[path_bytes] = 0;
+    GlobalUnlock(hg);
+
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_HDROP, hg);
+        CloseClipboard();
+        /* hg is now owned by the clipboard -- don't free. */
+    } else {
+        GlobalFree(hg);
+    }
+}
+
+/* ---- background jobs --------------------------------------------------
+ * The trampoline CoInitializes the worker thread so ShellExecute works
+ * from here (it silently no-ops on threads without COM initialized). */
+typedef struct { PlatJobFn fn; void* arg; } WinJob;
+static DWORD WINAPI win_job_trampoline(LPVOID lp) {
+    WinJob* j = (WinJob*)lp;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    j->fn(j->arg);
+    if (SUCCEEDED(hr)) CoUninitialize();
+    free(j);
+    return 0;
+}
+void plat_run_background(PlatJobFn fn, void* arg) {
+    WinJob* j = (WinJob*)malloc(sizeof *j);
+    j->fn = fn; j->arg = arg;
+    HANDLE h = CreateThread(NULL, 0, win_job_trampoline, j, 0, NULL);
+    if (h) CloseHandle(h);
+    else   { fn(arg); free(j); }   /* fallback: synchronous */
+}

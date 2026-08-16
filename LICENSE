@@ -1,0 +1,76 @@
+ORB_Recorder — public domain dedication
+=======================================
+
+Written by Alex Maximilius ("Alex Maz") — https://github.com/AlexMaximilius
+Dedicated to the public domain by its copyright holder, 2026.
+
+Two lines rather than one on purpose. A dedication works by a copyright
+holder giving up rights, so it needs someone able to hold them. Authorship
+and the capacity to sign rights away are different questions; this states
+both rather than collapsing them and leaving the dedication on uncertain
+ground.
+
+--------------------------------------------------------------------------
+
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute
+this software, either in source code form or as a compiled binary, for any
+purpose, commercial or non-commercial, and by any means.
+
+In jurisdictions that recognize copyright laws, the author or authors of this
+software dedicate any and all copyright interest in the software to the public
+domain. We make this dedication for the benefit of the public at large and to
+the detriment of our heirs and successors. We intend this dedication to be an
+overt act of relinquishment in perpetuity of all present and future rights to
+this software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <https://unlicense.org>
+
+
+--------------------------------------------------------------------------
+BUNDLED THIRD-PARTY CODE
+--------------------------------------------------------------------------
+
+The dedication above covers the original work in this repository. Two
+vendored single-header libraries carry their own terms, and those terms
+travel with the code. They are not ours to release.
+
+  stb_image.h
+    Sean Barrett and contributors.
+    Dual-licensed: public domain (Unlicense) OR MIT. Either may be used.
+    https://github.com/nothings/stb
+
+  simplewebp.h
+    Google Inc., Miku AuahDark, and contributors.
+    BSD 3-Clause. Requires that the copyright notice, this list of
+    conditions, and the disclaimer be retained in redistributions.
+    The full text and the WebM codec patent grant are inside the header.
+    https://github.com/MikuAuahDark/simplewebp
+
+Original to this project and covered by the dedication above:
+
+  orb_recorder.c          application core
+  platform.h              the OS abstraction seam
+  platform_win32.c        Windows implementation
+  platform_win32_video.c  Windows H.264/AAC via Media Foundation + WASAPI
+  platform_x11.c          Linux / X11 implementation
+  gif.h                   GIF89a writer (LZW encoder, tree dictionary).
+                          The container layout and LZW algorithm follow the
+                          published GIF89a specification (Appendix E); the
+                          encoder structure is conventional and mirrors the
+                          well-known gif-h layout by Charlie Tangora
+                          (public domain).
+  gif_reader.h            GIF89a reader (LZW decoder, frame compositing)
+  png_write.h             PNG writer
+
+GLFW is a build dependency, not bundled here. GLFW is zlib/libpng licensed.
+
+The LZW patents expired worldwide in 2004.
