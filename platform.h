@@ -158,6 +158,7 @@ enum {
     PLAT_MENU_DBL_MP4         = 142,   /* double-click arms for MP4        */
     PLAT_MENU_SHOT_REGION     = 143,   /* PNG of a dragged rectangle       */
     PLAT_MENU_SHOT_WINDOW     = 144,   /* PNG of the focused window        */
+    PLAT_MENU_SHOT_DELAY_5    = 148,   /* the monitor under the cursor, after 5s */
     PLAT_MENU_RUN_AT_STARTUP  = 145,   /* launch when the user logs in     */
     PLAT_MENU_HIDE_ORB        = 146,   /* hide the orb; tray is the way back */
     PLAT_MENU_MONITOR_BASE    = 200,   /* GIF:   + monitor index */
@@ -315,6 +316,15 @@ int      plat_camera_list (char names[][64], int max);
  * per frame. */
 bool     plat_camera_in_use(int index);
 
+/* Find an open popup menu on screen, if there is one.
+ *
+ * Delayed capture exists to photograph menus, and photographing a whole
+ * 3440x1440 monitor to show a menu 300 px wide is not what anyone wanted.
+ * Windows gives popup menus their own window class (#32768), so the menu
+ * can be found and captured exactly. Returns false when no menu is open,
+ * and the caller falls back to the monitor. */
+bool     plat_find_open_menu(int* x, int* y, int* w, int* h);
+
 /* Why the last plat_camera_open() failed, in words the user can act on.
  *
  * Media Foundation's HRESULTs are specific and the difference matters --
@@ -330,5 +340,20 @@ void     plat_camera_close(void);
 /* ---- background jobs -------------------------------------------------- */
 typedef void (*PlatJobFn)(void* arg);
 void plat_run_background(PlatJobFn fn, void* arg);
+
+/* Keep the main loop's work going while the platform is inside a MODAL
+ * loop of its own.
+ *
+ * Showing a popup menu means TrackPopupMenu, which does not return until
+ * the menu closes -- and it is called from inside a GLFW callback, so the
+ * whole main loop stops with it. Recording stops too, which is why the orb
+ * could not record its own right-click menu: the frames simply were not
+ * being taken.
+ *
+ * Register a function here and the platform will call it periodically
+ * while it is blocked. On Windows that is a WM_TIMER, which the menu's own
+ * modal loop dispatches. Pass NULL to clear. */
+typedef void (*PlatModalTickFn)(void);
+void plat_set_modal_tick(PlatModalTickFn fn);
 
 #endif /* GIFORB_PLATFORM_H */

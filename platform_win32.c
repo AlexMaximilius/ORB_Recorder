@@ -176,6 +176,32 @@ bool plat_restart_elevated(void) {
  * but the shell still sends restore/tasklist/activateapp traffic when the
  * taskbar button is clicked -- that's what we watch for. */
 static WNDPROC       g_orig_wndproc = NULL;
+static HWND          g_orb_hwnd     = NULL;
+
+/* WM_HOTKEY has to be latched rather than read straight out of the queue.
+ *
+ * RegisterHotKey(NULL, ...) posts a THREAD message -- hwnd 0 -- and any
+ * message pump that is not ours pulls it out and drops it on the floor, because
+ * DispatchMessage has no window to deliver it to. GLFW's pump does that, and so
+ * does the modal loop behind a popup menu: press F5 while the orb's own menu is
+ * open and the keystroke simply disappears (measured).
+ *
+ * Registering against the orb's window instead turns it into a window message,
+ * which every pump delivers to the window proc below -- so it survives whoever
+ * happens to own the thread, and the main loop picks it up when it comes back. */
+static volatile LONG g_hotkey_latch = 0;
+
+static int hotkey_id_to_plat(WPARAM id) {
+    if (id == HOTKEY_ID_F5)    return PLAT_HK_F5;
+    if (id == HOTKEY_ID_ESC)   return PLAT_HK_ESCAPE;
+    if (id == HOTKEY_ID_F6)    return PLAT_HK_F6;
+    if (id == HOTKEY_ID_F7)    return PLAT_HK_F7;
+    if (id == HOTKEY_ID_F8)    return PLAT_HK_F8;
+    if (id == HOTKEY_ID_F9)    return PLAT_HK_F9;
+    if (id == HOTKEY_ID_F4)    return PLAT_HK_F4;
+    if (id == HOTKEY_ID_PRTSC) return PLAT_HK_PRTSC;
+    return 0;
+}
 static volatile LONG g_activation   = 0;
 
 /* Tray */
@@ -184,8 +210,28 @@ static volatile LONG g_activation   = 0;
 static volatile LONG g_tray_event = 0;
 static bool          g_tray_on    = false;
 
+/* Called from WM_TIMER while a modal loop has the thread. See
+ * plat_set_modal_tick() in platform.h for why this exists. */
+static PlatModalTickFn g_modal_tick = NULL;
+#define ORB_MODAL_TIMER_ID 0xB060
+
+void plat_set_modal_tick(PlatModalTickFn fn) { g_modal_tick = fn; }
+
 static LRESULT CALLBACK orb_subclass_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_TIMER:
+        /* The whole point: a menu's modal loop dispatches this, so whatever
+         * the main loop would have been doing keeps happening. */
+        if (wp == ORB_MODAL_TIMER_ID && g_modal_tick) {
+            g_modal_tick();
+            return 0;
+        }
+        break;
+    case WM_HOTKEY: {
+        int id = hotkey_id_to_plat(wp);
+        if (id) { InterlockedExchange(&g_hotkey_latch, id); return 0; }
+        break;
+    }
     case WM_ACTIVATEAPP:
         if (wp) InterlockedExchange(&g_activation, 1);
         break;
@@ -321,6 +367,7 @@ void plat_window_setup(struct GLFWwindow* w) {
 
     /* Install activation subclass once. */
     if (!g_orig_wndproc) {
+        g_orb_hwnd = h;
         g_orig_wndproc = (WNDPROC)SetWindowLongPtr(h, GWLP_WNDPROC,
                                                    (LONG_PTR)orb_subclass_proc);
     }
@@ -654,50 +701,44 @@ int plat_enum_monitors(PlatMonitor* out, int max) {
 
 /* ---- hotkeys ---------------------------------------------------------- */
 bool plat_register_hotkey(int id) {
-    if (id == PLAT_HK_F5)     return RegisterHotKey(NULL, HOTKEY_ID_F5,  MOD_NOREPEAT, VK_F5)     != 0;
-    if (id == PLAT_HK_ESCAPE) return RegisterHotKey(NULL, HOTKEY_ID_ESC, 0,            VK_ESCAPE) != 0;
-    if (id == PLAT_HK_F6)     return RegisterHotKey(NULL, HOTKEY_ID_F6,  MOD_NOREPEAT, VK_F6)     != 0;
-    if (id == PLAT_HK_F7)     return RegisterHotKey(NULL, HOTKEY_ID_F7,  MOD_NOREPEAT, VK_F7)     != 0;
-    if (id == PLAT_HK_F8)     return RegisterHotKey(NULL, HOTKEY_ID_F8,  MOD_NOREPEAT, VK_F8)     != 0;
-    if (id == PLAT_HK_F9)     return RegisterHotKey(NULL, HOTKEY_ID_F9,  MOD_NOREPEAT, VK_F9)     != 0;
-    if (id == PLAT_HK_F4)     return RegisterHotKey(NULL, HOTKEY_ID_F4,  MOD_NOREPEAT, VK_F4)     != 0;
+    if (id == PLAT_HK_F5)     return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_F5,  MOD_NOREPEAT, VK_F5)     != 0;
+    if (id == PLAT_HK_ESCAPE) return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_ESC, 0,            VK_ESCAPE) != 0;
+    if (id == PLAT_HK_F6)     return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_F6,  MOD_NOREPEAT, VK_F6)     != 0;
+    if (id == PLAT_HK_F7)     return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_F7,  MOD_NOREPEAT, VK_F7)     != 0;
+    if (id == PLAT_HK_F8)     return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_F8,  MOD_NOREPEAT, VK_F8)     != 0;
+    if (id == PLAT_HK_F9)     return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_F9,  MOD_NOREPEAT, VK_F9)     != 0;
+    if (id == PLAT_HK_F4)     return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_F4,  MOD_NOREPEAT, VK_F4)     != 0;
     /* PrintScreen is bound to Snipping Tool on Windows 11 out of the box,
      * so this can legitimately fail. The caller reports that honestly
      * rather than leaving a checkbox that silently will not tick. */
-    if (id == PLAT_HK_PRTSC)  return RegisterHotKey(NULL, HOTKEY_ID_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT) != 0;
-    if (id == PLAT_HK_F8)     return RegisterHotKey(NULL, HOTKEY_ID_F8,  MOD_NOREPEAT, VK_F8)     != 0;
+    if (id == PLAT_HK_PRTSC)  return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT) != 0;
+    if (id == PLAT_HK_F8)     return RegisterHotKey(g_orb_hwnd, HOTKEY_ID_F8,  MOD_NOREPEAT, VK_F8)     != 0;
     return false;
 }
 void plat_unregister_hotkey(int id) {
-    if (id == PLAT_HK_F5)     UnregisterHotKey(NULL, HOTKEY_ID_F5);
-    if (id == PLAT_HK_ESCAPE) UnregisterHotKey(NULL, HOTKEY_ID_ESC);
-    if (id == PLAT_HK_F6)     UnregisterHotKey(NULL, HOTKEY_ID_F6);
-    if (id == PLAT_HK_F7)     UnregisterHotKey(NULL, HOTKEY_ID_F7);
-    if (id == PLAT_HK_F8)     UnregisterHotKey(NULL, HOTKEY_ID_F8);
-    if (id == PLAT_HK_F9)     UnregisterHotKey(NULL, HOTKEY_ID_F9);
-    if (id == PLAT_HK_F4)     UnregisterHotKey(NULL, HOTKEY_ID_F4);
-    if (id == PLAT_HK_PRTSC)  UnregisterHotKey(NULL, HOTKEY_ID_PRTSC);
-    if (id == PLAT_HK_F8)     UnregisterHotKey(NULL, HOTKEY_ID_F8);
+    if (id == PLAT_HK_F5)     UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_F5);
+    if (id == PLAT_HK_ESCAPE) UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_ESC);
+    if (id == PLAT_HK_F6)     UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_F6);
+    if (id == PLAT_HK_F7)     UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_F7);
+    if (id == PLAT_HK_F8)     UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_F8);
+    if (id == PLAT_HK_F9)     UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_F9);
+    if (id == PLAT_HK_F4)     UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_F4);
+    if (id == PLAT_HK_PRTSC)  UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_PRTSC);
+    if (id == PLAT_HK_F8)     UnregisterHotKey(g_orb_hwnd, HOTKEY_ID_F8);
 }
 int plat_poll_hotkey(void) {
-    int fired = 0;
     MSG msg;
     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_HOTKEY) {
-            if      (msg.wParam == HOTKEY_ID_F5)  fired = PLAT_HK_F5;
-            else if (msg.wParam == HOTKEY_ID_ESC) fired = PLAT_HK_ESCAPE;
-            else if (msg.wParam == HOTKEY_ID_F6)  fired = PLAT_HK_F6;
-            else if (msg.wParam == HOTKEY_ID_F7)  fired = PLAT_HK_F7;
-            else if (msg.wParam == HOTKEY_ID_F8)  fired = PLAT_HK_F8;
-            else if (msg.wParam == HOTKEY_ID_F9)  fired = PLAT_HK_F9;
-            else if (msg.wParam == HOTKEY_ID_F4)  fired = PLAT_HK_F4;
-            else if (msg.wParam == HOTKEY_ID_PRTSC) fired = PLAT_HK_PRTSC;
-            else if (msg.wParam == HOTKEY_ID_F8)  fired = PLAT_HK_F8;
+        /* A hotkey registered before the window existed is still a thread
+         * message with nowhere to be dispatched, so latch it here too. */
+        if (msg.message == WM_HOTKEY && !msg.hwnd) {
+            int id = hotkey_id_to_plat(msg.wParam);
+            if (id) InterlockedExchange(&g_hotkey_latch, id);
         }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    return fired;
+    return (int)InterlockedExchange(&g_hotkey_latch, 0);
 }
 
 /* ---- right-click menu ------------------------------------------------- */
@@ -722,6 +763,13 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
     /* --- screenshot: the quickest path of all --- */
     AppendMenuA(root, MF_STRING, PLAT_MENU_SHOT_REGION, "Screenshot: region\tF4 / PrtSc");
     AppendMenuA(root, MF_STRING, PLAT_MENU_SHOT_WINDOW, "Screenshot: window");
+    /* One row, not a submenu. Delayed capture exists for one job --
+     * photographing a menu, which cannot be done any other way because
+     * Windows menus close on any keystroke. Five seconds is enough to
+     * reopen a menu and long enough not to rush; offering 3 and 10 as
+     * well cost three rows of a menu that is already long. */
+    AppendMenuA(root, MF_STRING, PLAT_MENU_SHOT_DELAY_5,
+                "Screenshot: delayed 5s (captures menus)");
     AppendMenuA(root, MF_SEPARATOR, 0, NULL);
 
     /* --- GIF --- */
@@ -840,6 +888,12 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
 
     POINT p; GetCursorPos(&p);
 
+    /* Keep the main loop's work alive for as long as this menu is up. Without
+     * this the thread is parked in TrackPopupMenu and any recording in
+     * progress simply stops taking frames -- which is why the orb could not
+     * record its own menu. 30 ms is one frame at the video rate. */
+    SetTimer(h, ORB_MODAL_TIMER_ID, 30, NULL);
+
     /* TrackPopupMenu needs a foreground window or the menu will not dismiss
      * when the user clicks away -- but that activation is exactly what makes
      * the shell restore the taskbar button. Do it, then put the style back. */
@@ -847,6 +901,7 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
     int cmd = TrackPopupMenu(root,
                              TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN,
                              p.x, p.y, 0, h, NULL);
+    KillTimer(h, ORB_MODAL_TIMER_ID);
     DestroyMenu(root);
 
     /* The documented incantation: without this the menu can leave the window
@@ -1335,6 +1390,37 @@ void plat_window_set_visible(struct GLFWwindow* w, bool visible) {
 
 bool plat_taskbar_button_enforce(struct GLFWwindow* w, bool hidden) {
     return apply_taskbar_button(glfwGetWin32Window(w), hidden);
+}
+
+/* Windows popup menus -- including ours, the taskbar's, and any application's
+ * context menu -- are top-level windows of class "#32768". Finding one is how
+ * a screenshot tool photographs a menu precisely rather than photographing a
+ * screen and asking the user to crop. */
+bool plat_find_open_menu(int* x, int* y, int* w, int* h) {
+    HWND m = NULL;
+    for (HWND hw = GetTopWindow(NULL); hw; hw = GetWindow(hw, GW_HWNDNEXT)) {
+        char cls[64] = {0};
+        if (!IsWindowVisible(hw)) continue;
+        if (!GetClassNameA(hw, cls, sizeof cls)) continue;
+        if (strcmp(cls, "#32768") != 0) continue;
+        RECT r;
+        if (!GetWindowRect(hw, &r)) continue;
+        if (r.right - r.left < 40 || r.bottom - r.top < 20) continue;
+        m = hw;
+        break;                      /* topmost visible menu wins */
+    }
+    if (!m) return false;
+
+    RECT r;
+    if (!GetWindowRect(m, &r)) return false;
+
+    /* A few pixels of margin so the drop shadow is not sliced off. */
+    const int PAD = 8;
+    *x = r.left - PAD;
+    *y = r.top  - PAD;
+    *w = (r.right  - r.left) + PAD * 2;
+    *h = (r.bottom - r.top)  + PAD * 2;
+    return true;
 }
 
 /* ---- run at login -----------------------------------------------------

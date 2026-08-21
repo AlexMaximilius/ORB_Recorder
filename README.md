@@ -4,6 +4,13 @@ A dime-sized always-on-top orb that records your screen to **GIF** or **MP4
 with sound**, records a **camera**, takes **screenshots**, and views **every
 image format your machine has a decoder for**.
 
+![ORB_Recorder recording its own right-click menu](media/orb_records_its_own_menu.gif)
+
+*The orb recording itself.* It is mid-MP4 — magenta, `REC` — while its own
+right-click menu is open on top of it. A popup menu is a modal loop that parks
+the program that opened it; the capture runs straight through it anyway.
+[Full quality](media/orb_records_its_own_menu.mp4).
+
 One keypress. No dialogs. No account. No installer. **One 900 KB binary** —
 copy it anywhere, run it, and tick *Run at startup* if you want it back at
 login. Delete the file and it's uninstalled.
@@ -38,14 +45,40 @@ and paste.
 
 Also: **double-click** the orb to arm, then click the window you want.
 **Scroll** over it to resize. **Right-click** for everything else — monitor
-capture, sound source, *Run at startup*, and a checkbox per hotkey so you can
-hand F5 back to whatever else wants it.
+capture, a **delayed screenshot** that can photograph an open menu, sound
+source, *Run at startup*, and a checkbox per hotkey so you can hand F5 back to
+whatever else wants it.
 
 **Drop a file on the orb.** GIFs open a frame editor with trim. Images open a
 viewer. Videos open in your default player.
 
 Colour is state: orange idle, yellow armed, **red recording GIF**, **magenta
 recording video**, **cyan recording camera**, green editing.
+
+---
+
+## New in 2.1
+
+**Recording no longer stops while the orb's own right-click menu is open.**
+A popup menu is a modal message loop: it does not return until the menu
+closes, and it is entered from inside an input callback, so the entire main
+loop — capture included — was parked for as long as the menu was up. Frames
+were not being dropped, they were never being taken. The capture tick is now
+driven by a timer message, which the modal loop dispatches like any other. On
+a nine-second clip with the menu held open for five of them: **76 frames
+before, 231 after.** The GIF at the top of this page is the result.
+
+**Hotkeys no longer disappear while that menu is open.** They were registered
+against the thread, which makes `WM_HOTKEY` a thread message with no window to
+be delivered to — so any message pump that was not ours pulled it out and
+dropped it. Registering against the window instead means every pump routes it
+home.
+
+**A delayed screenshot** in the right-click menu, because a still of an open
+menu has no other route: every screenshot hotkey is an interactive region
+drag, and interacting dismisses the menu you were trying to photograph.
+
+Also: the version resource said 1.0.0.0 and now says what it is.
 
 ---
 
@@ -177,7 +210,8 @@ dialog box.
 ## Prior art / defensive publication
 
 **Written by Alex Maximilius ("Alex Maz"). Published 2026-08-15 and
-dedicated to the public domain by its copyright holder.**
+dedicated to the public domain by its copyright holder.** Items 13–15 were
+added 2026-08-21 and are published as of that date.
 
 This section exists so the design described here **cannot be patented by
 anyone**, including me. Publication with a date establishes prior art: what is
@@ -226,6 +260,17 @@ automatically.
     raising the containing folder with the file selected, as one action.
 12. Continuing to operate with a 2D-rendered object when no 3D context can be
     created, retaining capture because capture does not depend on 3D.
+13. Continuing a capture across the capturing application's **own modal loop**
+    — a popup menu or dialog — by driving the capture tick from a timer
+    message that the modal loop itself dispatches, so that an application can
+    record its own transient user interface.
+14. Registering global hotkeys against the application's **window** rather
+    than its thread, so that the key survives any foreign message pump,
+    including the application's own modal menus.
+15. Performing a timed capture from a background thread rather than the main
+    loop, so that it fires on schedule while the user interface thread is
+    inside a modal loop — capturing transient interface elements (menus,
+    tooltips, drag states) that any keystroke would dismiss.
 
 **Also disclosed, as obvious extensions:** any other shape in place of a
 circle; any other colour scheme or use of motion, size, opacity or sound to

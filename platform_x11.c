@@ -1067,6 +1067,13 @@ bool plat_taskbar_button_enforce(struct GLFWwindow* w, bool hidden) {
     return false;
 }
 
+/* X11 has no single menu window class -- toolkits each do their own, and
+ * override-redirect covers tooltips and drag images too. Report none and
+ * let the caller fall back to the monitor. */
+bool plat_find_open_menu(int* x, int* y, int* w, int* h) {
+    (void)x; (void)y; (void)w; (void)h; return false;
+}
+
 /* ---- run at login -----------------------------------------------------
  * freedesktop autostart: a .desktop file in $XDG_CONFIG_HOME/autostart.
  * Every mainstream desktop honours it, and the user can remove it from their
@@ -1199,6 +1206,11 @@ static void* pthread_trampoline(void* p) {
     free(j);
     return NULL;
 }
+/* The X11 menu is drawn and driven by our own code rather than by a
+ * platform modal loop, so nothing blocks the caller and there is nothing
+ * to keep alive. Accept the registration and ignore it. */
+void plat_set_modal_tick(PlatModalTickFn fn) { (void)fn; }
+
 void plat_run_background(PlatJobFn fn, void* arg) {
     PxJob* j = (PxJob*)malloc(sizeof *j);
     j->fn = fn; j->arg = arg;

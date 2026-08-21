@@ -269,6 +269,19 @@ static bool g_no3d = false;
  * icon must exist before the orb can disappear, or there is no way back. */
 static bool g_orb_hidden = false;
 
+/* Delayed whole-screen capture.
+ *
+ * The only way to photograph a menu. Windows menus are modal and close on any
+ * keystroke that is not a menu key, so a screenshot hotkey dismisses the very
+ * thing being captured -- ours included, which is how this came to be needed:
+ * documenting the program was impossible with the program.
+ *
+ * Whole screen rather than a region, because the region selector is itself a
+ * full-screen window and would cover whatever you were trying to photograph.
+ * Crop afterwards. */
+static volatile bool g_shot_pending = false;
+static volatile bool g_shot_cancel  = false;
+
 static char g_img_exts[2048];   /* ".bmp,.gif,.jpg,..." from the OS */
 
 static FILE* g_log = NULL;
@@ -1024,7 +1037,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v2.0",
+    "ORB_RECORDER  v2.1",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1033,6 +1046,7 @@ static const char* HELP_LINES[] = {
     "RECORDING",
     "  F4 / PRTSC      SCREENSHOT A REGION -> PNG",
     "  HIDE ORB        RIGHT-CLICK MENU; TRAY ICON BRINGS IT BACK",
+    "  DELAYED SHOT    RIGHT-CLICK MENU; THE ONLY WAY TO CAPTURE A MENU",
     "  F5              RECORD THE FOCUSED WINDOW / STOP",
     "  F6              DRAG A REGION, RECORD IT / STOP",
     "  F7              RECORD VIDEO + SOUND, WINDOW / STOP",
@@ -1421,6 +1435,13 @@ static void stop_recording(void) {
     g.state = next;
     g.targetWindow = NULL;
 }
+
+/* Registered with plat_set_modal_tick(), so recording keeps taking frames
+ * while a popup menu owns the thread. Only the recording tick -- redrawing
+ * the orb from inside someone else's modal loop is asking for trouble, and
+ * the orb is not what you are recording. */
+static void modal_tick(void);
+static void draw_orb_frame(void);
 
 static void tick_recording(void) {
     if (g.state != ORB_RECORDING) return;
@@ -2716,6 +2737,7 @@ static void handle_f8(void);            /* defined below */
 static void start_camera_record(int index);
 static void handle_shot_region(void);
 static void shoot_window_handle(void* fg);
+static void shot_delayed_start(int seconds);
 
 /* Arm, and say what the next click will do.
  *
@@ -2771,6 +2793,8 @@ static void handle_menu_command(int cmd) {
         } else {
             popup_mode("START", "FAILED", "Could not change the startup entry.");
         }
+    } else if (cmd == PLAT_MENU_SHOT_DELAY_5) {
+        shot_delayed_start(5);
     } else if (cmd == PLAT_MENU_SHOT_REGION) {
         handle_shot_region();
     } else if (cmd == PLAT_MENU_SHOT_WINDOW) {
@@ -2893,6 +2917,38 @@ static void on_mouse_button(GLFWwindow* win, int button, int action, int mods) {
         int cmd = plat_show_menu(g.window, &st, g.monitors, g.nmonitors);
         handle_menu_command(cmd);
     }
+}
+
+/* One frame of the orb. Factored out of the main loop because the modal tick
+ * needs it too: while a popup menu is up the main loop is not running, and an
+ * orb frozen mid-pulse in the middle of a recording looks like a hang. */
+static void draw_orb_frame(void) {
+    if (g_no3d) {
+        /* Colour still carries the state -- that is the orb's whole job,
+         * and it is the part that must survive losing the driver. */
+        float rf, gf, bf;
+        state_color(&rf, &gf, &bf);
+        plat_draw_orb_2d(g.window, ORB_WIN_SIZE, ORB_SIZE,
+                         (unsigned char)(rf * 255.0f),
+                         (unsigned char)(gf * 255.0f),
+                         (unsigned char)(bf * 255.0f));
+        return;
+    }
+    glfwMakeContextCurrent(g.window);
+    int w, h; glfwGetFramebufferSize(g.window, &w, &h);
+    draw_orb(w, h);
+    glViewport(0, 0, w, h);              /* rings + toast use the whole window */
+    draw_ping_rings(w, h);
+    draw_popup_overlay(w, h);
+    glfwSwapBuffers(g.window);
+}
+
+/* Everything that must not stop just because a menu is open: the frames being
+ * recorded, and the orb that is being recorded with them. Deliberately not the
+ * whole main loop -- input, dragging and window moves belong to the menu while
+ * the menu has the mouse. */
+static void modal_tick(void) {
+    tick_recording();
 }
 
 static void tick_armed_picker(void) {
@@ -3067,6 +3123,106 @@ static void save_screenshot(const uint8_t* rgba, int w, int h, const char* label
 }
 
 /* F4: drag a rectangle, get a PNG. */
+/* Delayed capture runs on its OWN THREAD, and it has to.
+ *
+ * The obvious implementation -- check a deadline in the main loop -- does not
+ * work, and the reason is the whole point of the feature. TrackPopupMenu is a
+ * MODAL message loop: while a menu is open the main loop does not run at all.
+ * So the timer could only ever fire after the menu closed, which is precisely
+ * when there is no longer a menu to photograph. First attempt did exactly
+ * that.
+ *
+ * A background thread keeps counting regardless of what is modal on the UI
+ * thread. Screen capture through GDI is safe from another thread; it reads
+ * the desktop, it does not touch our window. */
+typedef struct { int seconds; } ShotDelayJob;
+
+static void shot_delayed_job(void* arg) {
+    ShotDelayJob* j = (ShotDelayJob*)arg;
+    int secs = j->seconds;
+    free(j);
+
+    /* Count down out loud, but only while nothing modal is up -- popup_mode
+     * touches shared state, and a menu being open is the normal case here. */
+    for (int t = secs; t > 0; t--) {
+        plat_sleep_ms(1000);
+        if (g_shot_cancel) { g_shot_cancel = false; g_shot_pending = false; return; }
+    }
+    if (g_shot_cancel) { g_shot_cancel = false; g_shot_pending = false; return; }
+
+    /* An open menu if there is one, otherwise the monitor under the cursor.
+     *
+     * Capturing a whole 3440x1440 screen to show a menu 300 px wide is not
+     * what the feature is for. Windows gives popup menus their own window
+     * class, so when one is open it can be captured exactly -- which makes
+     * "captures menus" literally true rather than approximately true. */
+    int mx, my, mw, mh;
+    if (plat_find_open_menu(&mx, &my, &mw, &mh)) {
+        uint8_t* mpx = plat_capture_rect(mx, my, mw, mh, mw, mh);
+        if (mpx) {
+            char mlabel[64];
+            snprintf(mlabel, sizeof mlabel, "Menu_%dx%d", mw, mh);
+            save_screenshot(mpx, mw, mh, mlabel);
+            free(mpx);
+            log_write("shot", "delayed capture: menu %dx%d at (%d,%d)", mw, mh, mx, my);
+            g_shot_pending = false;
+            return;
+        }
+    }
+
+    /* The monitor under the cursor, not the whole desktop.
+     *
+     * With three screens the virtual desktop is 7280x1440 and almost all of
+     * it is empty -- a screenshot nobody wants and a file nobody can post.
+     * A menu opens where the pointer is, so that is the screen to capture. */
+    PlatMonitor mons[GIF_MAX_MONITORS];
+    int n = plat_enum_monitors(mons, GIF_MAX_MONITORS);
+    int cx = 0, cy = 0;
+    plat_get_cursor(&cx, &cy);
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    for (int i = 0; i < n; i++) {
+        if (cx >= mons[i].x && cx < mons[i].x + mons[i].w &&
+            cy >= mons[i].y && cy < mons[i].y + mons[i].h) {
+            x0 = mons[i].x; y0 = mons[i].y; w = mons[i].w; h = mons[i].h;
+            break;
+        }
+    }
+    if (w == 0 && n > 0) { x0 = mons[0].x; y0 = mons[0].y; w = mons[0].w; h = mons[0].h; }
+    if (w >= 16 && h >= 16) {
+        uint8_t* px = plat_capture_rect(x0, y0, w, h, w, h);
+        if (px) {
+            char label[64];
+            snprintf(label, sizeof label, "Screen_%dx%d", w, h);
+            save_screenshot(px, w, h, label);
+            free(px);
+        } else {
+            log_write("shot", "delayed capture failed");
+        }
+    }
+    g_shot_pending = false;
+}
+
+static void shot_delayed_start(int seconds) {
+    if (g.state == ORB_RECORDING) {
+        popup_mode("PNG", "BUSY", "Stop recording first.");
+        return;
+    }
+    if (g_shot_pending) {
+        popup_mode("PNG", "WAITING", "A delayed shot is already counting down.");
+        return;
+    }
+    ShotDelayJob* j = (ShotDelayJob*)malloc(sizeof *j);
+    if (!j) return;
+    j->seconds = seconds;
+    g_shot_pending = true;
+    g_shot_cancel  = false;
+    popup_mode("PNG", "TIMER",
+               "Whole screen in %d seconds -- open whatever you want to "
+               "capture and leave it open.", seconds);
+    log_write("shot", "delayed whole-screen capture in %ds", seconds);
+    plat_run_background(shot_delayed_job, j);
+}
+
 static void handle_shot_region(void) {
     if (g.state == ORB_RECORDING) { popup_mode("PNG", "BUSY", "Stop recording first."); return; }
     int rx, ry, rw, rh;
@@ -3264,6 +3420,11 @@ static void start_camera_record(int index) {
 }
 
 static void handle_escape(void) {
+    if (g_shot_pending) {
+        g_shot_cancel = true;
+        popup_mode("PNG", "CANCEL", "Delayed screenshot cancelled.");
+        return;
+    }
     if (g.state == ORB_RECORDING) stop_recording();
 }
 
@@ -3436,6 +3597,8 @@ int main(int argc, char** argv) {
         settings_mark_dirty();
     }
 
+    /* Recording must survive our own popup menus. */
+    plat_set_modal_tick(modal_tick);
     plat_window_load_icon(g.window);
     /* Only the round part of the square window is the window -- clicks in
      * the transparent corners go to whatever is behind it. */
@@ -3495,9 +3658,10 @@ int main(int argc, char** argv) {
     uint64_t lastTopMost = plat_now_ms();
 
     while (!glfwWindowShouldClose(g.window)) {
-        /* Poll hotkeys BEFORE glfwPollEvents -- GLFW's Windows message pump
-         * grabs WM_HOTKEY (a thread message, hwnd=NULL) with PeekMessage and
-         * silently discards it. Doing our poll first lets us catch F5/Esc. */
+        /* Hotkeys are latched by the platform when the key is pressed, not
+         * read out of the queue here, so it no longer matters which pump
+         * happens to be running -- GLFW's, or the modal loop behind our own
+         * popup menu. Both used to eat WM_HOTKEY and lose the keystroke. */
         int hk;
         while ((hk = plat_poll_hotkey()) != 0) {
             if (hk == PLAT_HK_F5)     handle_f5();
@@ -3579,25 +3743,11 @@ int main(int argc, char** argv) {
         }
 
         /* ---- draw the orb (its own context) ---- */
+        draw_orb_frame();
         if (g_no3d) {
-            /* Colour still carries the state -- that is the orb's whole job,
-             * and it is the part that must survive losing the driver. */
-            float rf, gf, bf;
-            state_color(&rf, &gf, &bf);
-            plat_draw_orb_2d(g.window, ORB_WIN_SIZE, ORB_SIZE,
-                             (unsigned char)(rf * 255.0f),
-                             (unsigned char)(gf * 255.0f),
-                             (unsigned char)(bf * 255.0f));
             plat_sleep_ms(33);          /* no vsync to pace us in 2D */
             continue;
         }
-        glfwMakeContextCurrent(g.window);
-        int w, h; glfwGetFramebufferSize(g.window, &w, &h);
-        draw_orb(w, h);
-        glViewport(0, 0, w, h);          /* rings + toast use the whole window */
-        draw_ping_rings(w, h);
-        draw_popup_overlay(w, h);
-        glfwSwapBuffers(g.window);
 
         /* ---- help window ---- */
         if (g_help_win) {
