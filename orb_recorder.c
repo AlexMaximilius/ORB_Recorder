@@ -264,6 +264,12 @@ typedef struct {
     int         ed_nfiles;
     int         ed_file_idx;
     bool        ed_is_static;     /* true = still image, false = animated GIF */
+
+    /* How this image got here. A capture you just took is a document, not a
+     * folder: the browse chevrons down each side are noise, and they sit
+     * exactly where an annotation wants to be drawn. A file you dropped, or
+     * picked, IS an entry in a folder, and browsing it is the point. */
+    bool        ed_browsing;
     int         ed_thumb_prev_count; /* strip textures currently allocated */
 } App;
 
@@ -1057,7 +1063,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.2",
+    "ORB_RECORDER  v3.3",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1724,6 +1730,7 @@ static void on_ed_mouse(GLFWwindow* w, int button, int action, int mods);
 static void on_ed_cursor(GLFWwindow* w, double mx, double my);
 static void on_ed_char(GLFWwindow* w, unsigned int cp);
 static void an_reset(void);
+static void an_autosave(void);
 static void ed_draw_arrows(int w, int h);
 
 #define ED_MAX_FILES 512
@@ -1808,6 +1815,7 @@ static bool ed_load_still(const char* path) {
 
 static void ed_close(void) {
     if (!g.ed_open) return;
+    an_autosave();
     /* Textures live in the editor context -- make it current to delete them. */
     if (g.ed_window) {
         glfwMakeContextCurrent(g.ed_window);
@@ -1915,6 +1923,12 @@ static void ed_goto_file(int idx) {
     strncpy(next, g.ed_files[idx], sizeof next - 1);
     next[sizeof next - 1] = 0;
 
+    /* Before anything is unloaded. Sitting further down -- after
+     * ed_load_media has already replaced g.ed_r -- it wrote the pixels of the
+     * NEW image over the OLD image's path, which is worse than the lost marks
+     * it was added to prevent. */
+    an_autosave();
+
     glfwMakeContextCurrent(g.ed_window);
     GifReaderClose(&g.ed_r);
     if (!ed_load_media(next)) {
@@ -1925,6 +1939,7 @@ static void ed_goto_file(int idx) {
     strncpy(g.ed_path, next, sizeof g.ed_path - 1);
     g.ed_path[sizeof g.ed_path - 1] = 0;
     an_reset();
+    g.ed_browsing = true;      /* you have left the capture and gone walking */
 
     g.ed_frame = 0;
     g.ed_trim_in = 0;
@@ -2070,6 +2085,7 @@ static bool ed_open_path(const char* path) {
             return false;
         }
     }
+    an_autosave();
     if (g.ed_open) ed_close();
     if (!ed_load_media(path)) {
         popup("BAD FILE", "Could not decode: %s", path);
@@ -2138,6 +2154,7 @@ static bool ed_open_path(const char* path) {
     glDisable(GL_DEPTH_TEST);
 
     an_reset();
+    g.ed_browsing = true;
     g.ed_open = true;
     g.ed_frame = 0;
     g.ed_trim_in = 0;
@@ -2261,7 +2278,26 @@ static const uint32_t AN_COLOR[AN_NCOLOR] = {
     0xFF20C0, 0xFFFFFF, 0x101010, 0xFF8000
 };
 
-#define AN_UNDO_MAX 12
+/* Undo keeps the RECTANGLE a step disturbed, not the whole picture.
+ *
+ * The first version snapshotted the entire image per step, on the reasoning
+ * that screenshots are small. A region grab is; a 4K screen is 33 MB, and
+ * twelve of those on the undo stack plus twelve more on the redo stack is
+ * 800 MB for having drawn twelve arrows. An arrow disturbs perhaps 40 KB.
+ *
+ * So a step stores its bounding box and the pixels that were under it. Crop
+ * is the one operation that changes the image's dimensions, and it keeps a
+ * whole-image entry -- flagged by w == 0 -- which is both rare and the only
+ * case that genuinely needs one. */
+#define AN_UNDO_MAX   24
+#define AN_UNDO_BYTES (192u * 1024u * 1024u)   /* ceiling for both stacks */
+
+typedef struct {
+    int      x, y, w, h;     /* w == 0: whole-image entry (a crop) */
+    int      img_w, img_h;   /* dimensions that entry restores to */
+    uint8_t* px;
+} AnStep;
+
 #define AN_BAR_H    30
 #define AN_BTN_W    44
 #define AN_SW_W     20
@@ -2284,9 +2320,15 @@ static struct {
     char     text[80];
     int      tx, ty;             /* text anchor, in IMAGE pixels */
 
-    uint8_t* undo[AN_UNDO_MAX]; int undo_w[AN_UNDO_MAX], undo_h[AN_UNDO_MAX];
-    uint8_t* redo[AN_UNDO_MAX]; int redo_w[AN_UNDO_MAX], redo_h[AN_UNDO_MAX];
+    AnStep   undo[AN_UNDO_MAX], redo[AN_UNDO_MAX];
     int      undo_n, redo_n;
+
+    /* A pen stroke's extent is not known until the mouse comes up, so the
+     * whole image is held for the duration and trimmed to the strokes's
+     * bounding box at the end. One transient copy, not one per step. */
+    uint8_t* pen_hold;
+    int      pen_x0, pen_y0, pen_x1, pen_y1;
+
     bool     dirty;
 } an;
 
@@ -2300,14 +2342,19 @@ static PaintImg an_target(void) {
 static uint32_t an_rgb(void) { return AN_COLOR[an.color_idx]; }
 static bool an_active(void)  { return g.ed_open && g.ed_is_static && an_img(); }
 
-static void an_free_stack(uint8_t** st, int* n) {
-    for (int i = 0; i < *n; i++) { free(st[i]); st[i] = NULL; }
+static void an_free_stack(AnStep* st, int* n) {
+    for (int i = 0; i < *n; i++) { free(st[i].px); st[i].px = NULL; }
     *n = 0;
+}
+
+static size_t an_step_bytes(const AnStep* s) {
+    return (size_t)(s->w ? s->w : s->img_w) * (s->w ? s->h : s->img_h) * 4;
 }
 
 static void an_reset(void) {
     an_free_stack(an.undo, &an.undo_n);
     an_free_stack(an.redo, &an.redo_n);
+    free(an.pen_hold); an.pen_hold = NULL;
     free(an.preview); an.preview = NULL; an.pw = an.ph = 0;
     an.dragging = false;
     an.typing   = false;
@@ -2319,32 +2366,6 @@ static void an_reset(void) {
 
 static void an_retexture(void) { g.ed_main_tex_frame = -1; }
 
-/* Snapshot the whole image before a change. Screenshots are small enough that
- * copying one is cheaper to write and to reason about than a journal of
- * inverse operations -- and it makes crop, which changes the dimensions,
- * exactly as undoable as a pen stroke instead of a special case. */
-static void an_push_undo(void) {
-    uint8_t* src = an_img();
-    if (!src) return;
-    size_t n = (size_t)g.ed_r.width * g.ed_r.height * 4;
-    uint8_t* cp = (uint8_t*)malloc(n);
-    if (!cp) return;
-    memcpy(cp, src, n);
-    if (an.undo_n == AN_UNDO_MAX) {                 /* drop the oldest */
-        free(an.undo[0]);
-        memmove(an.undo,   an.undo   + 1, sizeof(uint8_t*) * (AN_UNDO_MAX - 1));
-        memmove(an.undo_w, an.undo_w + 1, sizeof(int)      * (AN_UNDO_MAX - 1));
-        memmove(an.undo_h, an.undo_h + 1, sizeof(int)      * (AN_UNDO_MAX - 1));
-        an.undo_n--;
-    }
-    an.undo[an.undo_n]   = cp;
-    an.undo_w[an.undo_n] = g.ed_r.width;
-    an.undo_h[an.undo_n] = g.ed_r.height;
-    an.undo_n++;
-    an_free_stack(an.redo, &an.redo_n);             /* a new edit forks time */
-    an.dirty = true;
-}
-
 static void an_swap_image(uint8_t* px, int w, int h) {
     free(g.ed_r.frames[0].rgba);
     g.ed_r.frames[0].rgba = px;
@@ -2353,34 +2374,117 @@ static void an_swap_image(uint8_t* px, int w, int h) {
     an_retexture();
 }
 
-static void an_shift(uint8_t** dst, int* dn, int* dw, int* dh,
-                     uint8_t** src, int* sn, int* sw, int* sh) {
-    size_t n = (size_t)g.ed_r.width * g.ed_r.height * 4;
-    uint8_t* cur = (uint8_t*)malloc(n);
-    if (cur) {
-        memcpy(cur, an_img(), n);
-        if (*dn < AN_UNDO_MAX) {
-            dst[*dn] = cur; dw[*dn] = g.ed_r.width; dh[*dn] = g.ed_r.height;
-            (*dn)++;
-        } else free(cur);
+/* Copy a region out of the current image. w == 0 asks for the whole thing. */
+static bool an_grab(AnStep* out, int x, int y, int w, int h) {
+    uint8_t* src = an_img();
+    if (!src) return false;
+    int W = g.ed_r.width, H = g.ed_r.height;
+    out->img_w = W; out->img_h = H;
+    if (w <= 0) {                                   /* whole image */
+        out->x = out->y = out->w = out->h = 0;
+        out->px = (uint8_t*)malloc((size_t)W * H * 4);
+        if (!out->px) return false;
+        memcpy(out->px, src, (size_t)W * H * 4);
+        return true;
     }
-    (*sn)--;
-    an_swap_image(src[*sn], sw[*sn], sh[*sn]);
-    src[*sn] = NULL;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    if (w <= 0 || h <= 0) return false;
+    out->x = x; out->y = y; out->w = w; out->h = h;
+    out->px = (uint8_t*)malloc((size_t)w * h * 4);
+    if (!out->px) return false;
+    for (int r = 0; r < h; r++)
+        memcpy(out->px + (size_t)r * w * 4,
+               src + ((size_t)(y + r) * W + x) * 4, (size_t)w * 4);
+    return true;
+}
+
+static void an_restore(const AnStep* s) {
+    if (s->w == 0) {                                /* a crop, going back */
+        uint8_t* cp = (uint8_t*)malloc((size_t)s->img_w * s->img_h * 4);
+        if (!cp) return;
+        memcpy(cp, s->px, (size_t)s->img_w * s->img_h * 4);
+        an_swap_image(cp, s->img_w, s->img_h);
+        return;
+    }
+    uint8_t* dst = an_img();
+    if (!dst) return;
+    int W = g.ed_r.width;
+    for (int r = 0; r < s->h; r++)
+        memcpy(dst + ((size_t)(s->y + r) * W + s->x) * 4,
+               s->px + (size_t)r * s->w * 4, (size_t)s->w * 4);
+    an_retexture();
+}
+
+/* Drop the oldest entries until the two stacks fit the ceiling. Whole-image
+ * entries are the only ones large enough to matter, and a run of crops is the
+ * only way to accumulate them. */
+static void an_trim(AnStep* st, int* n) {
+    size_t total = 0;
+    for (int i = 0; i < an.undo_n; i++) total += an_step_bytes(&an.undo[i]);
+    for (int i = 0; i < an.redo_n; i++) total += an_step_bytes(&an.redo[i]);
+    while (*n > 1 && total > AN_UNDO_BYTES) {
+        total -= an_step_bytes(&st[0]);
+        free(st[0].px);
+        memmove(st, st + 1, sizeof(AnStep) * (size_t)(*n - 1));
+        (*n)--;
+    }
+}
+
+static void an_push_step(AnStep s) {
+    if (an.undo_n == AN_UNDO_MAX) {
+        free(an.undo[0].px);
+        memmove(an.undo, an.undo + 1, sizeof(AnStep) * (AN_UNDO_MAX - 1));
+        an.undo_n--;
+    }
+    an.undo[an.undo_n++] = s;
+    an_free_stack(an.redo, &an.redo_n);             /* a new edit forks time */
+    an_trim(an.undo, &an.undo_n);
+    an.dirty = true;
+}
+
+/* Record the pixels a step is about to disturb. */
+static void an_push_rect(int x0, int y0, int x1, int y1) {
+    if (x1 < x0) { int t = x0; x0 = x1; x1 = t; }
+    if (y1 < y0) { int t = y0; y0 = y1; y1 = t; }
+    AnStep s;
+    if (an_grab(&s, x0, y0, x1 - x0 + 1, y1 - y0 + 1)) an_push_step(s);
+}
+
+static void an_push_full(void) {
+    AnStep s;
+    if (an_grab(&s, 0, 0, 0, 0)) an_push_step(s);
+}
+
+static void an_move(AnStep* from, int* fn, AnStep* to, int* tn) {
+    AnStep cur;
+    const AnStep* s = &from[*fn - 1];
+    bool have = s->w ? an_grab(&cur, s->x, s->y, s->w, s->h)
+                     : an_grab(&cur, 0, 0, 0, 0);
+    an_restore(s);
+    free(from[*fn - 1].px);
+    (*fn)--;
+    if (have) {
+        if (*tn == AN_UNDO_MAX) {
+            free(to[0].px);
+            memmove(to, to + 1, sizeof(AnStep) * (AN_UNDO_MAX - 1));
+            (*tn)--;
+        }
+        to[(*tn)++] = cur;
+    }
+    an.dirty = true;
 }
 
 static void an_undo(void) {
     if (an.undo_n <= 0) { popup_mode("PNG", "UNDO", "Nothing to undo."); return; }
-    an_shift(an.redo, &an.redo_n, an.redo_w, an.redo_h,
-             an.undo, &an.undo_n, an.undo_w, an.undo_h);
-    an.dirty = true;
+    an_move(an.undo, &an.undo_n, an.redo, &an.redo_n);
 }
 
 static void an_redo(void) {
     if (an.redo_n <= 0) { popup_mode("PNG", "REDO", "Nothing to redo."); return; }
-    an_shift(an.undo, &an.undo_n, an.undo_w, an.undo_h,
-             an.redo, &an.redo_n, an.redo_w, an.redo_h);
-    an.dirty = true;
+    an_move(an.redo, &an.redo_n, an.undo, &an.undo_n);
 }
 
 /* ---- text -------------------------------------------------------------
@@ -2528,12 +2632,14 @@ static void an_commit(void) {
         int cw = 0, ch = 0;
         uint8_t* out = paint_crop(an_target(), an.x0, an.y0, an.x1, an.y1, &cw, &ch);
         if (!out || cw < 4 || ch < 4) { free(out); an_retexture(); return; }
-        an_push_undo();
+        an_push_full();          /* the one step that changes the dimensions */
         an_swap_image(out, cw, ch);
         popup_mode("PNG", "CROP", "Cropped to %dx%d.", cw, ch);
         return;
     }
-    an_push_undo();
+    int bx0, by0, bx1, by1;
+    an_bbox(an.x0, an.y0, an.x1, an.y1, &bx0, &by0, &bx1, &by1);
+    an_push_rect(bx0, by0, bx1, by1);
     an_stroke(an_target(), an.tool, an.x0, an.y0, an.x1, an.y1);
     if (an.tool == TOOL_NUM) an.step_next++;
     an_retexture();
@@ -2541,7 +2647,13 @@ static void an_commit(void) {
 
 static void an_commit_text(void) {
     if (!an.text[0]) { an.typing = false; return; }
-    an_push_undo();
+    int px = an_text_px();
+    /* A generous superset: no glyph advances further than its own height, so
+     * this cannot be narrower than the text that lands. Undoing a box too
+     * large is free; undoing one too small leaves fragments behind. */
+    an_push_rect(an.tx - 2, an.ty - 2,
+                 an.tx + (int)strlen(an.text) * px + px,
+                 an.ty + px * 2);
     an_stamp_text(an_target(), an.tx, an.ty, an.text, an_text_px(), an_rgb());
     an.typing = false;
     an.text[0] = 0;
@@ -2581,6 +2693,20 @@ static void an_save(void) {
     popup_mode("PNG", "SAVED", "Saved %dx%d to %s",
                g.ed_r.width, g.ed_r.height, out);
     if (g.auto_clipboard) plat_clipboard_copy_file(out);
+}
+
+/* Annotations are never silently discarded.
+ *
+ * Take a screenshot while the editor is open with an unsaved arrow on it, or
+ * page to the next file, and the old image is thrown away -- along with the
+ * work. Prompting is not an option in a program whose whole premise is that
+ * nothing is a dialog, and the right answer is not in doubt anyway: Ctrl+S
+ * already overwrites, the file is a capture from a minute ago, and the
+ * version anybody wants is the annotated one. So it just saves. */
+static void an_autosave(void) {
+    if (!an.dirty || !g.ed_open || !g.ed_is_static || !an_img()) return;
+    an_save();
+    log_write("edit", "auto-saved unsaved marks before leaving %s", g.ed_path);
 }
 
 /* ---- toolbar ----------------------------------------------------------
@@ -2860,7 +2986,7 @@ static void ed_arrow_rects(int w, int h, int* lx, int* rx, int* ay, int* ah) {
 /* Big translucent chevrons down each side -- the viewer was keyboard-only,
  * which is fine once you know it and useless the first time. */
 static void ed_draw_arrows(int w, int h) {
-    if (!g.ed_open) return;
+    if (!g.ed_open || !g.ed_browsing) return;
     int lx, rx, ay, ah;
     ed_arrow_rects(w, h, &lx, &rx, &ay, &ah);
     float cy = (float)(ay + ah / 2);
@@ -2891,6 +3017,7 @@ static void ed_draw_arrows(int w, int h) {
 
 /* Returns -1 for the left arrow, +1 for the right, 0 for neither. */
 static int ed_arrow_hit(int w, int h, double mx, double my) {
+    if (!g.ed_browsing) return 0;
     int lx, rx, ay, ah;
     ed_arrow_rects(w, h, &lx, &rx, &ay, &ah);
     if (my < ay || my > ay + ah) return 0;
@@ -2915,6 +3042,10 @@ static void on_ed_cursor(GLFWwindow* win, double mx, double my) {
          * because the undo snapshot was taken when the mouse went down. */
         PaintImg im = an_target();
         paint_line(im, an.x0, an.y0, ix, iy, an_rgb(), an.thick);
+        if (ix < an.pen_x0) an.pen_x0 = ix;
+        if (ix > an.pen_x1) an.pen_x1 = ix;
+        if (iy < an.pen_y0) an.pen_y0 = iy;
+        if (iy > an.pen_y1) an.pen_y1 = iy;
         an.x0 = ix; an.y0 = iy;
         an_retexture();
         return;
@@ -2933,7 +3064,37 @@ static void on_ed_mouse(GLFWwindow* win, int button, int action, int mods) {
     if (action == GLFW_RELEASE) {
         if (an.dragging) {
             an.dragging = false;
-            if (an.tool == TOOL_PEN) { an_retexture(); return; }
+            if (an.tool == TOOL_PEN) {
+                /* Trim the held image down to the box the stroke actually
+                 * touched, so a scribble in one corner does not cost a copy
+                 * of the whole screen. */
+                if (an.pen_hold) {
+                    int pad = an.thick + 2;
+                    int x0 = an.pen_x0 - pad, y0 = an.pen_y0 - pad;
+                    int x1 = an.pen_x1 + pad, y1 = an.pen_y1 + pad;
+                    if (x0 < 0) x0 = 0;
+                    if (y0 < 0) y0 = 0;
+                    if (x1 > g.ed_r.width  - 1) x1 = g.ed_r.width  - 1;
+                    if (y1 > g.ed_r.height - 1) y1 = g.ed_r.height - 1;
+                    if (x1 >= x0 && y1 >= y0) {
+                        AnStep st;
+                        st.x = x0; st.y = y0;
+                        st.w = x1 - x0 + 1; st.h = y1 - y0 + 1;
+                        st.img_w = g.ed_r.width; st.img_h = g.ed_r.height;
+                        st.px = (uint8_t*)malloc((size_t)st.w * st.h * 4);
+                        if (st.px) {
+                            for (int r = 0; r < st.h; r++)
+                                memcpy(st.px + (size_t)r * st.w * 4,
+                                       an.pen_hold + ((size_t)(y0 + r) * (size_t)st.img_w + x0) * 4,
+                                       (size_t)st.w * 4);
+                            an_push_step(st);
+                        }
+                    }
+                    free(an.pen_hold); an.pen_hold = NULL;
+                }
+                an_retexture();
+                return;
+            }
             an_commit();
         }
         return;
@@ -2956,7 +3117,14 @@ static void on_ed_mouse(GLFWwindow* win, int button, int action, int mods) {
             an.dragging = true;
             an.x0 = an.x1 = ix; an.y0 = an.y1 = iy;
             an.px0 = ix; an.py0 = iy; an.px1 = ix; an.py1 = iy;
-            if (an.tool == TOOL_PEN) an_push_undo();
+            if (an.tool == TOOL_PEN) {
+                size_t n = (size_t)g.ed_r.width * g.ed_r.height * 4;
+                free(an.pen_hold);
+                an.pen_hold = (uint8_t*)malloc(n);
+                if (an.pen_hold) memcpy(an.pen_hold, an_img(), n);
+                an.pen_x0 = an.pen_x1 = ix;
+                an.pen_y0 = an.pen_y1 = iy;
+            }
             else an_preview_update();
             return;
         }
@@ -3481,7 +3649,8 @@ static void handle_menu_command(int cmd) {
         settings_mark_dirty();
     } else if (cmd == PLAT_MENU_OPEN_EDITOR) {
         char pick[512];
-        if (plat_open_file_dialog(pick, sizeof pick)) ed_open_path(pick);
+        if (plat_open_file_dialog(pick, sizeof pick) && ed_open_path(pick))
+            g.ed_browsing = true;
     } else if (cmd == PLAT_MENU_HELP) {
         help_open();
     } else if (cmd == PLAT_MENU_EDIT_SETTINGS) {
@@ -4395,7 +4564,7 @@ int main(int argc, char** argv) {
             char open_me[600];
             snprintf(open_me, sizeof open_me, "%s", g.pending_edit);
             g.pending_edit[0] = 0;
-            ed_open_path(open_me);
+            if (ed_open_path(open_me)) g.ed_browsing = false;
         }
         tick_drag();
         tick_armed_picker();

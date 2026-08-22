@@ -57,6 +57,38 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.3 — the editor stops losing things
+
+**The browse chevrons only appear when you are browsing.** They sit down each
+side of the editor, and on a capture you have just taken they are both noise
+and a hazard: they cover exactly where an annotation wants to be drawn, so an
+arrow near the edge paged the folder instead. A capture is a document; a file
+you dropped or picked is an entry in a folder. Now the chevrons follow that
+distinction, and reappear the moment you page with PgUp/PgDn.
+
+**Undo records the rectangle a step disturbed, not the whole picture.** The
+first version snapshotted the entire image per step, on the reasoning that
+screenshots are small. A region grab is; a 4K screen is 33 MB, and twelve of
+those on the undo stack plus twelve on the redo stack is 800 MB for having
+drawn twelve arrows. An arrow disturbs about 400 KB. Crop is the one operation
+that changes the dimensions and still keeps a whole-image entry, which is both
+rare and the only case that needs one.
+
+**Unsaved marks are saved rather than dropped.** Take a screenshot while the
+editor is open with an unsaved arrow on it, or page to the next file, and the
+old image used to be thrown away along with the work. Prompting is not an
+option in a program where nothing is a dialog, and the answer is not in doubt
+anyway — `Ctrl+S` already overwrites, and the version anyone wants is the
+annotated one. So it just saves.
+
+Undo being exact is checked rather than eyeballed: the test draws eight steps
+— arrow, box, oval, marker, pixelate, freehand, numbered disc and text —
+undoes all eight, saves, and compares the SHA-256 against the untouched
+capture. A bounding box one pixel too small leaves residue, and residue would
+change the hash.
+
+---
+
 ## New in 3.2 — screenshots got ten times smaller
 
 The PNG writer used to emit *uncompressed* deflate blocks. That is valid PNG
@@ -326,7 +358,7 @@ dialog box.
 
 **Written by Alex Maximilius ("Alex Maz"). Published 2026-08-15 and
 dedicated to the public domain by its copyright holder.** Items 13–16 were
-added 2026-08-21 and items 17–22 on 2026-08-22; each is published as of the
+added 2026-08-21 and items 17–25 on 2026-08-22; each is published as of the
 date given.
 
 This section exists so the design described here **cannot be patented by
@@ -416,6 +448,19 @@ automatically.
 22. Falling back to uncompressed storage whenever the compressed form of an
     image would not be smaller, so that adding compression to a writer cannot
     increase the size of any output it previously produced.
+23. Undoing an annotation by restoring only the bounding rectangle that the
+    annotation disturbed, recorded immediately before it is drawn, so that the
+    cost of an undo step is proportional to the mark rather than to the image;
+    with whole-image entries reserved for operations that change the image's
+    dimensions.
+24. Suppressing an image viewer's navigation controls when the image arrived
+    from a capture rather than from a folder, so that the same window serves
+    as a document editor and as a browser without the browser's controls
+    intercepting the editor's input.
+25. Committing an annotated image automatically when the editor's subject is
+    replaced -- by a new capture, by navigation, or by closing -- in place of
+    prompting, on the basis that the destination is already known and the
+    annotated version is the wanted one.
 
 **Also disclosed, as obvious extensions:** any other shape in place of a
 circle; any other colour scheme or use of motion, size, opacity or sound to
