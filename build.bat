@@ -19,6 +19,7 @@ gcc -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -mwindows -static -I"%GLFW_
 
 if %errorlevel% equ 0 (
     echo BUILD OK -- orb_recorder.exe
+    echo Run test.bat before shipping it.
 ) else (
     echo BUILD FAILED
     exit /b 1

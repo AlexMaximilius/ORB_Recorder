@@ -299,6 +299,34 @@ sudo apt install build-essential libglfw3-dev libx11-dev libxext-dev \
 ./build.sh
 ```
 
+### Test it
+
+```
+test.bat          (or ./test.sh)
+```
+
+Needs only the compiler; Python and Pillow are optional and add two more
+decoders. Non-zero exit on failure, so it can gate a release.
+
+It covers the two parts that are pure computation and can therefore be checked
+by a machine rather than by looking: the annotation rasteriser and the PNG
+writer. The rest of the program is a window, a hotkey and a screen grab, and
+is tested by running it — but those two are exactly where a regression hides,
+because **a broken compressor still produces files that open perfectly**. That
+is not hypothetical: during development a stale copy of `png_write.h` shadowed
+the real one, every output was silently uncompressed, and nothing looked wrong
+at all. So the suite asserts compression *ratios*, not just correctness.
+
+The rasteriser is checked against invariants rather than against a reference
+image: every test buffer carries a guard band, shapes must clip, a filled
+rectangle must cover exactly its own pixels, a rectangle dragged backwards
+must equal the same rectangle dragged forwards, the marker must leave what it
+marks readable, obfuscation must actually flatten a block, and a mask
+overhanging the right edge must not wrap onto the next row.
+
+Both failure modes were confirmed by breaking the code on purpose and watching
+the suite name the cause — a test that has never failed is decoration.
+
 > **Platform status, stated plainly.** Windows is the developed and tested
 > target. The Linux build compiles clean but has only ever been built on a
 > headless machine — every X11 path (XShm capture, XGrabKey, `_NET_WM_STATE`,
@@ -316,6 +344,7 @@ paint.h                 annotation rasteriser: lines, shapes, blur, masks
 gif.h                   GIF89a writer
 gif_reader.h            GIF89a reader
 png_write.h             PNG writer: deflate, adaptive filtering
+tests/                  test_paint.c, test_png.c, verify_png.py
 stb_image.h             still-image decode (vendored)
 simplewebp.h            WebP decode (vendored)
 ```

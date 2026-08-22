@@ -6,3 +6,11 @@ orb_recorder
 # Lives in the private mirrors; not part of what ships.
 IDEAS.md
 NOTE.md
+
+# test binaries and their scratch output
+tests/*.exe
+tests/test_paint
+tests/test_png
+tests/make_sample
+tests/verify_sample.png
+tests_*.png
