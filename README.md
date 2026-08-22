@@ -62,12 +62,22 @@ recording video**, **cyan recording camera**, green editing.
 3.8 was written against the portal and proven with a standalone test. Driving
 it through the actual program, on an actual Wayland laptop, found four things.
 
-**It provoked a crash in the desktop.** Abandoning a request by simply closing
-the D-Bus connection, while the compositor still had a picker open for it,
-segfaulted `xdg-desktop-portal-gnome` — `status=11/SEGV` in the journal. The
-spec provides `Request.Close()` for precisely this. Giving up quietly is not
-the same as giving up politely. With the close in place, the same abandoned
-request now leaves the portal running.
+**It provoked a crash in the desktop.** Abandoning a request while the
+compositor still had a picker open for it segfaulted
+`xdg-desktop-portal-gnome` — `status=11/SEGV` in the journal, and Ubuntu's
+crash dialog on screen. `Request.Close()` is in the spec for exactly this, so
+it is now sent before giving up.
+
+*That was not the whole story, and this file said it was.* The close alone did
+not stop it: a later run crashed the portal seven minutes after we walked
+away, when the orphaned picker — still on screen, because closing a request
+does not dismiss its UI — was touched. The real mistake was one level up. A
+two-minute deadline is something this program invented for a UI that has none:
+the picker waits for a human, and a human reading something else is not an
+error. The wait is now ten minutes and exists only as a backstop against a
+portal that has died without answering. Cancelling is the picker's own
+Escape, which returns a proper "cancelled" response and ends the request
+cleanly.
 
 **It trusted a Request path it had computed rather than the one it was
 given.** The portal is only *asked* to use our `handle_token` and may return a

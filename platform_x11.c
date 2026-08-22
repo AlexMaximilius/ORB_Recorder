@@ -1250,9 +1250,22 @@ bool plat_portal_screenshot(char* out_path, size_t out_sz) {
             }
 
             if (!db.error_is_set(&err)) {
-                /* Wait for the Response. Long, because a permission prompt
-                 * may be sitting in front of the user. */
-                uint64_t deadline = plat_now_ms() + 120000;
+                /* Wait for the Response, effectively for as long as the
+                 * user takes.
+                 *
+                 * This was two minutes, which was a deadline invented here
+                 * for a UI that has none: the portal's picker sits waiting
+                 * for a human, and a human reading something else is not an
+                 * error. Worse, giving up orphans that picker -- closing the
+                 * request does not take it off the screen -- and interacting
+                 * with an orphaned picker segfaulted xdg-desktop-portal-gnome
+                 * seven minutes after we walked away.
+                 *
+                 * So do not walk away. The picker's own Escape produces a
+                 * proper cancelled Response and ends this cleanly; the ten
+                 * minutes below is only a backstop against a portal that has
+                 * died without answering. */
+                uint64_t deadline = plat_now_ms() + 600000;
                 while (plat_now_ms() < deadline && !ok) {
                     if (!db.connection_read_write_dispatch(c, 200)) break;
                     DBusMsg* sig;
