@@ -57,6 +57,62 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.11 — the clipboard actually exists on Linux
+
+The headline of this program is *take a shot, alt-tab, paste*. On Linux that
+had never once worked.
+
+`plat_clipboard_copy_image` was an **empty function**. The file-copy path
+shelled out to `xclip` or `wl-copy` and, finding neither, printed a line to
+stderr that nobody reads — and a stock Ubuntu desktop has none of those tools
+installed. So the promise failed silently, which is the same species of bug as
+the black Wayland screenshots.
+
+The cause is a real misunderstanding of X: **X11 has no clipboard.** It has a
+protocol in which the program that copied *keeps* the data and serves it, on
+demand, to whoever pastes. Nothing is stored in between. A copy is not an
+event, it is a promise — and a promise nobody stays around to keep is an empty
+paste.
+
+The orb now owns the selection itself. No `xclip`, no `wl-copy`, no
+dependency: an unmapped 1×1 window owns `CLIPBOARD`, and
+`plat_clipboard_serve()` answers `SelectionRequest` every frame, offering
+`image/png`, `text/uri-list` and the path as text. It takes only selection
+traffic addressed to its own window — helping itself to the queue is exactly
+how the hotkey poll used to swallow every keystroke in the program.
+
+Verified with an unrelated client: `xclip` listed the full target set, pulled
+back a valid PNG, and returned the `file://` URI. The pasted image is
+pixel-identical to what was copied.
+
+Windows is untouched — `SetClipboardData` hands the bytes to the system and
+the program is free to forget them, so the serve function there is empty and
+correct.
+
+*Not yet verified:* pasting into a **native Wayland** application. Mutter
+bridges X selections to Wayland clients, so it ought to work, but it has not
+been tested.
+
+---
+
+## New in 3.10 — stop inventing a deadline the picker does not have
+
+A correction to 3.9, which claimed `Request.Close()` had stopped us crashing
+the portal. It had not, and the evidence for the claim was one abandoned
+request that happened not to crash in the minute it was watched. A later run
+segfaulted the portal seven minutes after we walked away, when the orphaned
+picker — still on screen, because closing a request does not dismiss its UI —
+was touched.
+
+`Close()` is correct and stays. The mistake was a level up: a two-minute
+timeout was a deadline invented here for a user-driven UI that has none. The
+picker waits for a human, and a human reading something else is not an error.
+The wait is now ten minutes and exists only as a backstop against a portal
+that has died without answering; cancelling is the picker's own Escape, which
+returns a proper cancelled response.
+
+---
+
 ## New in 3.9 — what a live Wayland desktop taught it
 
 3.8 was written against the portal and proven with a standalone test. Driving
