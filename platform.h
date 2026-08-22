@@ -248,6 +248,19 @@ const char* plat_capture_unavailable(void);
  * a background thread and never from the main loop. */
 bool plat_portal_screenshot(char* out_path, size_t out_sz);
 
+/* Hand the clipboard whatever it asks for, once per frame.
+ *
+ * X11 has no clipboard: it has a protocol in which the copying program
+ * KEEPS the data and serves it, on demand, to whoever pastes. Nothing is
+ * stored anywhere in between. So a copy is not an event, it is a promise --
+ * and a promise nobody is around to keep is how "it is on your clipboard"
+ * turns into an empty paste.
+ *
+ * Windows does not need this: SetClipboardData hands the bytes to the
+ * system and the program is free to forget them. The stub there is empty
+ * and correct. */
+void plat_clipboard_serve(void);
+
 /* Rasterise a string with the SYSTEM font, into an 8-bit coverage mask.
  *
  * The built-in 5x7 glyphs are uppercase-only and read like a pocket

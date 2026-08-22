@@ -1306,6 +1306,10 @@ uint8_t* plat_render_text(const char* s, int px_height, int* out_w, int* out_h) 
 const char* plat_capture_unavailable(void) { return NULL; }
 
 /* No portal, and none needed: BitBlt reads the screen here. */
+/* The Windows clipboard owns the bytes once they are handed over, so there
+ * is nothing to serve afterwards. */
+void plat_clipboard_serve(void) { }
+
 bool plat_portal_screenshot(char* out_path, size_t out_sz) {
     (void)out_path; (void)out_sz; return false;
 }

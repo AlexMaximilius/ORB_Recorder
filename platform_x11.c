@@ -1544,9 +1544,182 @@ void plat_open_with_default_app(const char* path) {
     }
 }
 
-/* Needs a persistent selection owner to serve image data; xclip can do it. */
+/* ---- clipboard --------------------------------------------------------
+ *
+ * X11 has no clipboard. It has a protocol in which the program that copied
+ * KEEPS the data and serves it to whoever pastes, on demand, over the wire.
+ * Nothing is stored in between. A copy is a promise, not an event.
+ *
+ * What was here shelled out to xclip or wl-copy and, finding neither,
+ * printed a line to stderr that nobody sees; plat_clipboard_copy_image was an
+ * empty function. So on Linux this program's headline -- take a shot, alt-tab,
+ * paste -- quietly did nothing, and a stock Ubuntu has none of those tools
+ * installed to begin with.
+ *
+ * Owning the selection ourselves removes the dependency and makes the promise
+ * real. The cost is that it must be KEPT: plat_clipboard_serve() answers
+ * SelectionRequest events every frame and the bytes live as long as the orb
+ * does. That is ordinary for X, and on a desktop with a clipboard manager --
+ * GNOME has one -- the content is taken over when we exit, so it outlives us.
+ */
+
+static Window   g_clip_win = 0;
+static uint8_t* g_clip_png = NULL;      /* the image, as PNG bytes */
+static size_t   g_clip_png_len = 0;
+static char     g_clip_path[700];       /* the file, for a file-manager paste */
+
+static Atom A_CLIPBOARD, A_TARGETS, A_PNG, A_URILIST, A_UTF8, A_STRING, A_TEXT;
+
+static bool path_looks_png(const char* p) {
+    size_t n = strlen(p);
+    return n > 4 && strcasecmp(p + n - 4, ".png") == 0;
+}
+
+static void clip_init(void) {
+    if (g_clip_win) return;
+    Display* d = dpy();
+    if (!d) return;
+    A_CLIPBOARD = XInternAtom(d, "CLIPBOARD", False);
+    A_TARGETS   = XInternAtom(d, "TARGETS", False);
+    A_PNG       = XInternAtom(d, "image/png", False);
+    A_URILIST   = XInternAtom(d, "text/uri-list", False);
+    A_UTF8      = XInternAtom(d, "UTF8_STRING", False);
+    A_STRING    = XInternAtom(d, "STRING", False);
+    A_TEXT      = XInternAtom(d, "TEXT", False);
+    /* An unmapped 1x1 window that exists only to be a selection owner. */
+    g_clip_win = XCreateSimpleWindow(d, DefaultRootWindow(d), -10, -10, 1, 1,
+                                     0, 0, 0);
+    XSelectInput(d, g_clip_win, PropertyChangeMask);
+}
+
+static void clip_own(void) {
+    clip_init();
+    if (!g_clip_win) return;
+    XSetSelectionOwner(dpy(), A_CLIPBOARD, g_clip_win, CurrentTime);
+    XFlush(dpy());
+}
+
+/* Read the file into memory. Holding the path alone would not be enough: the
+ * clipboard must be able to produce the bytes at any later moment, and by
+ * then the file may have been moved, edited or deleted. */
+static void clip_load_png(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n > 0 && n < 64 * 1024 * 1024) {
+        uint8_t* buf = (uint8_t*)malloc((size_t)n);
+        if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
+            free(g_clip_png);
+            g_clip_png = buf;
+            g_clip_png_len = (size_t)n;
+        } else {
+            free(buf);
+        }
+    }
+    fclose(f);
+}
+
+void plat_clipboard_copy_file(const char* file_path) {
+    snprintf(g_clip_path, sizeof g_clip_path, "%s", file_path);
+    if (path_looks_png(file_path)) clip_load_png(file_path);
+    clip_own();
+}
+
+/* png_write_rgba lives in the core translation unit. Declared rather than
+ * included so this file does not end up carrying a second copy of the
+ * encoder -- and so what is pasted is byte-identical to what is saved. */
+int png_write_rgba(const char* path, const uint8_t* rgba, int w, int h);
+
 void plat_clipboard_copy_image(const uint8_t* rgba, int w, int h) {
-    (void)rgba; (void)w; (void)h;
+    if (!rgba || w <= 0 || h <= 0) return;
+    const char* run = getenv("XDG_RUNTIME_DIR");
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s/orb_clip.png", run && run[0] ? run : "/tmp");
+    if (png_write_rgba(tmp, rgba, w, h)) {
+        clip_load_png(tmp);
+        remove(tmp);
+        clip_own();
+    }
+}
+
+/* Answer one SelectionRequest. */
+static void clip_answer(XSelectionRequestEvent* rq) {
+    Display* d = dpy();
+    XSelectionEvent res;
+    memset(&res, 0, sizeof res);
+    res.type      = SelectionNotify;
+    res.display   = d;
+    res.requestor = rq->requestor;
+    res.selection = rq->selection;
+    res.target    = rq->target;
+    res.time      = rq->time;
+    res.property  = None;
+
+    Atom prop = rq->property ? rq->property : rq->target;
+
+    if (rq->target == A_TARGETS) {
+        Atom offer[6];
+        int n = 0;
+        offer[n++] = A_TARGETS;
+        if (g_clip_png) offer[n++] = A_PNG;
+        if (g_clip_path[0]) {
+            offer[n++] = A_URILIST;
+            offer[n++] = A_UTF8;
+            offer[n++] = A_STRING;
+            offer[n++] = A_TEXT;
+        }
+        XChangeProperty(d, rq->requestor, prop, XA_ATOM, 32, PropModeReplace,
+                        (unsigned char*)offer, n);
+        res.property = prop;
+    } else if (rq->target == A_PNG && g_clip_png) {
+        XChangeProperty(d, rq->requestor, prop, A_PNG, 8, PropModeReplace,
+                        g_clip_png, (int)g_clip_png_len);
+        res.property = prop;
+    } else if (rq->target == A_URILIST && g_clip_path[0]) {
+        char uri[800];
+        int n = snprintf(uri, sizeof uri, "file://%s\r\n", g_clip_path);
+        XChangeProperty(d, rq->requestor, prop, A_URILIST, 8, PropModeReplace,
+                        (unsigned char*)uri, n);
+        res.property = prop;
+    } else if ((rq->target == A_UTF8 || rq->target == A_STRING ||
+                rq->target == A_TEXT) && g_clip_path[0]) {
+        XChangeProperty(d, rq->requestor, prop, rq->target, 8, PropModeReplace,
+                        (unsigned char*)g_clip_path, (int)strlen(g_clip_path));
+        res.property = prop;
+    }
+    XSendEvent(d, rq->requestor, False, 0, (XEvent*)&res);
+    XFlush(d);
+}
+
+/* Take only selection traffic addressed to our owner window. Everything else
+ * in the queue belongs to GLFW, and helping ourselves to it is exactly how
+ * the hotkey poll used to swallow every keystroke in the program. */
+static Bool clip_event(Display* d, XEvent* ev, XPointer arg) {
+    (void)d; (void)arg;
+    if (ev->type == SelectionRequest)
+        return ev->xselectionrequest.owner == g_clip_win ? True : False;
+    if (ev->type == SelectionClear)
+        return ev->xselectionclear.window == g_clip_win ? True : False;
+    return False;
+}
+
+void plat_clipboard_serve(void) {
+    if (!g_clip_win) return;
+    XEvent ev;
+    while (XCheckIfEvent(dpy(), &ev, clip_event, NULL)) {
+        if (ev.type == SelectionRequest) {
+            clip_answer(&ev.xselectionrequest);
+        } else if (ev.type == SelectionClear) {
+            /* Somebody else copied something. Let ours go: continuing to
+             * answer would be claiming a clipboard we no longer own. */
+            free(g_clip_png);
+            g_clip_png = NULL;
+            g_clip_png_len = 0;
+            g_clip_path[0] = 0;
+        }
+    }
 }
 
 /* ---- 2D fallback painting ---------------------------------------------
@@ -1690,30 +1863,6 @@ bool plat_set_run_at_startup(bool on) {
 /* ---- clipboard file-drop --------------------------------------------- *
  * X11 clipboards are per-client selection owners; a real file drop needs
  * a persistent daemon (xclip / wl-copy). Shell out when one exists. */
-void plat_clipboard_copy_file(const char* file_path) {
-    char* xclip = which("xclip");
-    if (xclip) {
-        char cmd[1024];
-        snprintf(cmd, sizeof cmd,
-                 "printf 'file://%%s\\n' '%s' | xclip -selection clipboard -t text/uri-list 2>/dev/null",
-                 file_path);
-        int rc = system(cmd);
-        (void)rc;
-        return;
-    }
-    char* wl = which("wl-copy");
-    if (wl) {
-        char cmd[1024];
-        snprintf(cmd, sizeof cmd,
-                 "printf 'file://%%s\\n' '%s' | wl-copy --type text/uri-list 2>/dev/null",
-                 file_path);
-        int rc = system(cmd);
-        (void)rc;
-        return;
-    }
-    fprintf(stderr, "[gif_orb] clipboard copy unavailable: install xclip or wl-copy.\n");
-}
-
 /* No font engine is linked here on purpose: pulling in Xft/fontconfig for
  * one string would be the first real dependency in the whole program. NULL
  * tells the caller to use the built-in glyphs, which is honest and visible

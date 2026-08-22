@@ -1088,7 +1088,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.10",
+    "ORB_RECORDER  v3.11",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -4730,6 +4730,7 @@ int main(int argc, char** argv) {
             g.pending_edit[0] = 0;
             if (ed_open_path(open_me)) g.ed_browsing = false;
         }
+        plat_clipboard_serve();   /* X11 copies are a promise we must keep */
         tick_drag();
         tick_armed_picker();
         tick_recording();
