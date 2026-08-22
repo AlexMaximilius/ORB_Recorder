@@ -57,6 +57,52 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.2 — screenshots got ten times smaller
+
+The PNG writer used to emit *uncompressed* deflate blocks. That is valid PNG
+and every viewer opens it, and it cost exactly four bytes per pixel: a 640×460
+capture came out at **1.18 MB**. These files exist to be pasted into chat
+windows, so that was the wrong trade to keep.
+
+The same capture is now **126 KB — 9.3× smaller**, and a 4K screen goes from
+33 MB to 180 KB. Three stages, in order of how much each one buys:
+
+- **Drop the alpha channel when every pixel is opaque.** Screen captures
+  always are. A quarter gone before anything is compressed.
+- **Filter each row adaptively** — None/Sub/Up/Average/Paeth, picked per row
+  by minimum sum of absolute differences. This is most of the win: a run of
+  identical pixels filters to zeroes.
+- **LZ77 with a 32K window and lazy matching**, as fixed-Huffman blocks.
+  Fixed, not dynamic — dynamic would gain perhaps another 15% and costs tree
+  construction and a tree encoder, both of which can be subtly wrong.
+
+If compression would not beat the raw bytes — pure noise does not compress —
+the old stored-block path is still there and is used instead, so the writer
+can never produce a file bigger than it used to.
+
+It costs some time, and here is the honest measurement rather than a claim,
+same machine, same content, including the write to disk:
+
+| capture | before | after | bytes before | bytes after |
+|---|---|---|---|---|
+| 1920×1080 | 49 ms | 81 ms | 8.3 MB | 47 KB |
+| 2560×1440 | 83 ms | 133 ms | 14.7 MB | 82 KB |
+| 3440×1440 | 121 ms | 179 ms | 19.8 MB | 108 KB |
+| 3840×2160 | 195 ms | 318 ms | 33.2 MB | 180 KB |
+
+Region grabs — most screenshots — are a few milliseconds either way. And the
+file being written is now a hundredth the size, which the table's disk time
+partly gives back on anything slower than a local SSD.
+
+Every output is round-tripped in the test suite and compared pixel for pixel,
+through **three independent decoders**: the vendored `stb_image`, Python's
+`zlib` with the unfiltering written out by hand, and PIL. That is deliberate
+paranoia — the GIF LZW encoder once produced files that decoded cleanly for
+two frames and then fell apart, and one decoder agreeing with the encoder that
+wrote it proves very little.
+
+---
+
 ## New in 3.1 — the editor is ours now
 
 ![The built-in screenshot editor](media/editor.png)
@@ -237,7 +283,7 @@ platform_x11.c          Linux: XShm, XGrabKey, XDG, gdk-pixbuf
 paint.h                 annotation rasteriser: lines, shapes, blur, masks
 gif.h                   GIF89a writer
 gif_reader.h            GIF89a reader
-png_write.h             PNG writer
+png_write.h             PNG writer: deflate, adaptive filtering
 stb_image.h             still-image decode (vendored)
 simplewebp.h            WebP decode (vendored)
 ```
@@ -280,7 +326,7 @@ dialog box.
 
 **Written by Alex Maximilius ("Alex Maz"). Published 2026-08-15 and
 dedicated to the public domain by its copyright holder.** Items 13–16 were
-added 2026-08-21 and items 17–20 on 2026-08-22; each is published as of the
+added 2026-08-21 and items 17–22 on 2026-08-22; each is published as of the
 date given.
 
 This section exists so the design described here **cannot be patented by
@@ -363,6 +409,13 @@ automatically.
     an application with no font library of its own still produces text in the
     system's typeface, falling back to a built-in bitmap font where no such
     engine is present.
+21. Choosing an image's stored channel count by inspecting whether any pixel
+    is non-opaque at the moment of writing, so that a capture which happens to
+    be fully opaque is stored without an alpha channel and one which is not
+    keeps it, with no setting and no user decision.
+22. Falling back to uncompressed storage whenever the compressed form of an
+    image would not be smaller, so that adding compression to a writer cannot
+    increase the size of any output it previously produced.
 
 **Also disclosed, as obvious extensions:** any other shape in place of a
 circle; any other colour scheme or use of motion, size, opacity or sound to
