@@ -1088,7 +1088,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.4",
+    "ORB_RECORDER  v3.5",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -3985,8 +3985,10 @@ static void save_screenshot(const uint8_t* rgba, int w, int h, const char* label
     plat_clipboard_copy_image(rgba, w, h);
     if (g.auto_clipboard) plat_clipboard_copy_file(path);
 
-    log_write("shot", "%dx%d -> %s", w, h, path);
-    popup_mode("PNG", "SAVED", "Saved %dx%d to %s", w, h, path);
+    const char* why = plat_capture_unavailable();
+    log_write("shot", "%dx%d -> %s%s", w, h, path, why ? " (LIKELY BLANK)" : "");
+    if (why) popup_mode("PNG", "PROBABLY BLANK", "%s", why);
+    else     popup_mode("PNG", "SAVED", "Saved %dx%d to %s", w, h, path);
 
     /* Raise the folder. plat_open_folder_select reuses a window already
      * showing it rather than stacking up a new one each time. */
@@ -4495,6 +4497,16 @@ int main(int argc, char** argv) {
         orb_move_to(g.orb_x, g.orb_y);
         anchor_from_position(g.orb_x, g.orb_y, g.orb_size, g.orb_size);
         settings_mark_dirty();
+    }
+
+    /* If capture cannot work here, say so at once and in the log, rather
+     * than letting the first screenshot come back black and look saved. */
+    {
+        const char* why = plat_capture_unavailable();
+        if (why) {
+            log_write("boot", "CAPTURE UNAVAILABLE: %s", why);
+            popup_mode("PNG", "NO CAPTURE", "%s", why);
+        }
     }
 
     /* Recording must survive our own popup menus. */

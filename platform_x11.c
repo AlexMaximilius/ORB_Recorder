@@ -228,7 +228,34 @@ static void set_wm_state(Window w, const char* prop, bool on) {
 
 void plat_window_setup(struct GLFWwindow* w) {
     Window x11w = glfwGetX11Window(w);
-    /* Always-on-top + sticky (present on every workspace). */
+
+    /* Take the orb out of the window manager's hands.
+     *
+     * The orb is drawn in the middle of a window several times its size, so
+     * that rings and toasts have room outside the body -- which means putting
+     * the orb near a corner requires the WINDOW at negative coordinates. A
+     * real window manager refuses: mutter clamped a request for (-276,-276)
+     * to (66,32) and the orb landed 340 pixels from where it was asked to go,
+     * every launch. Xvfb has no window manager, so this looked perfect there.
+     *
+     * override-redirect says "this is furniture, not an application window",
+     * which is what a desktop widget is; docks and on-screen displays have
+     * done it for decades. XMoveWindow is then honoured exactly. The window
+     * has to be unmapped for the change to take, so it is a hide/show cycle
+     * -- the same dance the Win32 side does for its taskbar-button styles.
+     *
+     * Only the orb. The editor and the region selector are ordinary windows
+     * and want the WM: titlebar, focus, alt-tab, the lot. */
+    XUnmapWindow(dpy(), x11w);
+    XSync(dpy(), False);
+    XSetWindowAttributes attr;
+    attr.override_redirect = True;
+    XChangeWindowAttributes(dpy(), x11w, CWOverrideRedirect, &attr);
+    XMapRaised(dpy(), x11w);
+    XSync(dpy(), False);
+
+    /* Still ask for above + sticky: harmless when unmanaged, and correct if a
+     * compositor honours the hints anyway. */
     set_wm_state(x11w, "_NET_WM_STATE_ABOVE", true);
     set_wm_state(x11w, "_NET_WM_STATE_STICKY", true);
     XFlush(dpy());
@@ -1182,6 +1209,38 @@ void plat_clipboard_copy_file(const char* file_path) {
  * rather than silently dropping the text. */
 uint8_t* plat_render_text(const char* s, int px_height, int* out_w, int* out_h) {
     (void)s; (void)px_height; (void)out_w; (void)out_h;
+    return NULL;
+}
+
+/* A Wayland session hands X clients an XWayland server whose root window is
+ * not the desktop: it contains only other X clients, and on GNOME not even
+ * those. XShmGetImage succeeds and returns black. `import` and `xwd` fail
+ * outright on the same display, which is the tell.
+ *
+ * Ask the X SERVER, not the environment. XWayland advertises an extension
+ * called XWAYLAND, and that is true however the process was started -- from a
+ * desktop launcher, from cron, or over an ssh session that inherits none of
+ * the session variables. The environment check was written first and reported
+ * a perfectly healthy X11 session in exactly the case it existed to catch.
+ *
+ * Not detected by capturing and inspecting the pixels: a legitimately black
+ * screenshot exists, and guessing from them would eventually accuse the wrong
+ * person. Capturing a Wayland desktop properly means the xdg-desktop-portal
+ * ScreenCast API over PipeWire -- a real dependency and a real project, and
+ * not something to fake. */
+const char* plat_capture_unavailable(void) {
+    int op = 0, ev = 0, err = 0;
+    if (XQueryExtension(dpy(), "XWAYLAND", &op, &ev, &err))
+        return "This is a Wayland session (XWayland). X11 capture comes back "
+               "black here -- the desktop is not in the X root window. Log out "
+               "and pick an Xorg session for capture to work.";
+
+    /* Secondary hint, for compositors that do not advertise the extension. */
+    const char* t = getenv("XDG_SESSION_TYPE");
+    const char* w = getenv("WAYLAND_DISPLAY");
+    if ((t && strcasecmp(t, "wayland") == 0) || (w && w[0]))
+        return "This looks like a Wayland session. X11 capture comes back "
+               "black there -- log out and pick an Xorg session instead.";
     return NULL;
 }
 

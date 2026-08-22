@@ -223,6 +223,20 @@ void plat_open_folder_select(const char* file_path);
  * Returns false if nothing could be launched. */
 bool plat_open_in_editor(const char* path);
 
+/* Why screen capture cannot work here, or NULL when it can.
+ *
+ * There is exactly one environment where everything else in this program
+ * runs correctly and capture silently returns black: an X11 client under a
+ * Wayland compositor. The window appears, hotkeys fire, the region selector
+ * works, the PNG is written and the editor opens on it -- and the image is
+ * empty, because the X root window no longer holds the desktop. Saying
+ * nothing is the worst option; a black screenshot that claims to have saved
+ * is a bug report from a confused user at best.
+ *
+ * Returns a short sentence for the log and a popup, or NULL if capture is
+ * expected to work. */
+const char* plat_capture_unavailable(void);
+
 /* Rasterise a string with the SYSTEM font, into an 8-bit coverage mask.
  *
  * The built-in 5x7 glyphs are uppercase-only and read like a pocket

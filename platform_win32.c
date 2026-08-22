@@ -1301,6 +1301,10 @@ uint8_t* plat_render_text(const char* s, int px_height, int* out_w, int* out_h) 
     return mask;
 }
 
+/* Windows composites through the DWM and BitBlt/PrintWindow keep working,
+ * so there is no equivalent trap here. */
+const char* plat_capture_unavailable(void) { return NULL; }
+
 bool plat_open_in_editor(const char* path) {
     char norm[MAX_PATH];
     size_t n = strlen(path);

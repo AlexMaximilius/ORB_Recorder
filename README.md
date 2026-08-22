@@ -57,6 +57,41 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.5 — Wayland tells the truth
+
+3.4 was tested under Xvfb, which has no window manager and is real X11. A
+laptop running **GNOME on Wayland** is neither, and it found two things that
+setup could not.
+
+**On Wayland, capture was silently returning black.** X clients there talk to
+XWayland, whose root window is not the desktop. Everything else worked
+perfectly — the orb drew, the hotkey fired, the region selector appeared, a
+PNG was written, the editor opened on it — and the image was 700×400 of pure
+black, mean 0, standard deviation 0, reported as *Saved*. `import` and `xwd`
+fail outright on the same display; we succeeded and returned nothing.
+
+It now says so, at startup and again on every capture. The check asks the **X
+server** whether the XWAYLAND extension is present rather than reading
+`XDG_SESSION_TYPE` — the first version read the environment and reported a
+healthy X11 session in exactly the case it was written to catch, because a
+process started over ssh inherits none of the session variables. Real Xorg is
+unaffected and says nothing.
+
+Capturing a Wayland desktop properly means xdg-desktop-portal ScreenCast over
+PipeWire. That is a real dependency and a real project; until then the honest
+thing is to refuse to pretend.
+
+**The orb was landing in the wrong place on every managed desktop.** It is
+drawn in the middle of a window several times its size, so putting it near a
+corner needs the window at negative coordinates — and a window manager refuses.
+Mutter clamped (-276,-276) to (66,32), leaving the orb about 340 px adrift.
+The orb window is now `override-redirect`: furniture rather than an
+application window, which is what a desktop widget is and what docks have done
+for decades. The editor and the region selector stay ordinary managed windows,
+because they want a titlebar and focus.
+
+---
+
 ## New in 3.4 — it runs on Linux
 
 ![ORB_Recorder on Ubuntu](media/linux.png)
@@ -380,11 +415,18 @@ the suite name the cause — a test that has never failed is decoration.
 > text, `Ctrl+S`. Format enumeration through gdk-pixbuf reports 27 decoders.
 > The test suite passes with byte-identical output to Windows.
 >
-> *Still unexercised:* a real window manager — Xvfb has none, so always-on-top,
-> the tray and taskbar behaviour, and drag-and-drop onto the orb are untested.
-> So are the zenity right-click menu, the clipboard (`xclip`/`wl-copy`), and a
-> hardware GL driver. Video and camera remain Windows-only; Linux reports them
-> unavailable rather than pretending. Expect to fix things — but it works.
+> As of 3.5 it has also run on a **GNOME laptop with a real window manager**,
+> where the orb is placed correctly via override-redirect and hotkeys fire.
+>
+> **On Wayland, capture does not work and the program says so.** X11 capture
+> reads the X root window, and under a Wayland compositor that is not the
+> desktop — the result is black. Log out and choose an Xorg session, or use
+> Windows, until portal/PipeWire capture exists.
+>
+> *Still unexercised:* the tray, drag-and-drop onto the orb, the zenity
+> right-click menu, and the clipboard (`xclip`/`wl-copy`). Video and camera
+> remain Windows-only; Linux reports them unavailable rather than pretending.
+> Expect to fix things — but it works.
 
 ```
 orb_recorder.c          core: orb, capture loop, editor, viewer
