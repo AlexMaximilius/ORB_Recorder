@@ -9,8 +9,8 @@
 IDI_ORB ICON "orb.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     3,8,0,0
-PRODUCTVERSION  3,8,0,0
+FILEVERSION     3,9,0,0
+PRODUCTVERSION  3,9,0,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS__WINDOWS32
@@ -23,11 +23,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Alex Maximilius (Alex Maz) / 324x"
             VALUE "FileDescription",  "ORB_Recorder - always-on-top screen recorder"
-            VALUE "FileVersion",      "3.8.0.0"
+            VALUE "FileVersion",      "3.9.0.0"
             VALUE "InternalName",     "orb_recorder"
             VALUE "OriginalFilename", "orb_recorder.exe"
             VALUE "ProductName",      "ORB_Recorder"
-            VALUE "ProductVersion",   "3.8.0.0"
+            VALUE "ProductVersion",   "3.9.0.0"
             VALUE "LegalCopyright",   "Public domain - Alex Maz, 2026"
         END
     END

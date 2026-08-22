@@ -1176,6 +1176,7 @@ bool plat_portal_screenshot(char* out_path, size_t out_sz) {
 
     bool ok = false;
     char token[64], expect[256], match[512];
+    char handle_out[256] = {0};      /* the Request path, for Close() below */
     /* The token only has to be unique within this connection. */
     snprintf(token, sizeof token, "orb%u", (unsigned)(plat_now_ms() & 0xFFFFFFu));
 
@@ -1189,10 +1190,16 @@ bool plat_portal_screenshot(char* out_path, size_t out_sz) {
                  "/org/freedesktop/portal/desktop/request/%s/%s", sender, token);
 
         /* Listen BEFORE asking: a quick compositor can answer before the
-         * match rule would otherwise be in place. */
+         * match rule would otherwise be in place.
+         *
+         * Deliberately NOT filtered on the path. The portal is only asked to
+         * use our handle_token, and is entitled to hand back a different
+         * Request path -- so the path is checked when a signal arrives,
+         * against both the one it returned and the one we predicted, rather
+         * than being baked into a rule that would silently match nothing. */
         snprintf(match, sizeof match,
                  "type='signal',interface='org.freedesktop.portal.Request',"
-                 "member='Response',path='%s'", expect);
+                 "member='Response'");
         db.bus_add_match(c, match, &err);
 
         DBusMsg* m = db.message_new_method_call(
@@ -1227,9 +1234,20 @@ bool plat_portal_screenshot(char* out_path, size_t out_sz) {
             portal_opt(&opts, "interactive", DB_TYPE_BOOLEAN, "b", &yes);
             db.message_iter_close_container(&args, &opts);
 
+            char* handle = handle_out;
             DBusMsg* reply = db.connection_send_with_reply_and_block(c, m, 10000, &err);
             db.message_unref(m);
-            if (reply) db.message_unref(reply);
+            if (reply) {
+                /* The authoritative Request path, straight from the portal. */
+                DBusIter r;
+                if (db.message_iter_init(reply, &r) &&
+                    db.message_iter_get_arg_type(&r) == DB_TYPE_OBJECT_PATH) {
+                    const char* h = NULL;
+                    db.message_iter_get_basic(&r, &h);
+                    if (h) snprintf(handle_out, sizeof handle_out, "%s", h);
+                }
+                db.message_unref(reply);
+            }
 
             if (!db.error_is_set(&err)) {
                 /* Wait for the Response. Long, because a permission prompt
@@ -1242,7 +1260,8 @@ bool plat_portal_screenshot(char* out_path, size_t out_sz) {
                         if (db.message_is_signal(sig, "org.freedesktop.portal.Request",
                                                  "Response")) {
                             const char* path = db.message_get_path(sig);
-                            if (path && strcmp(path, expect) == 0) {
+                            if (path && (strcmp(path, expect) == 0 ||
+                                         (handle[0] && strcmp(path, handle) == 0))) {
                                 DBusIter it;
                                 if (db.message_iter_init(sig, &it) &&
                                     db.message_iter_get_arg_type(&it) == DB_TYPE_UINT32) {
@@ -1268,6 +1287,25 @@ bool plat_portal_screenshot(char* out_path, size_t out_sz) {
             }
         }
     }
+    /* Abandoning a request without closing it leaves the compositor holding a
+     * picker for a caller that has gone. xdg-desktop-portal-gnome was seen to
+     * segfault on exactly that, so say goodbye properly: Request.Close() is in
+     * the spec for this, and giving up quietly is not the same as giving up
+     * politely. */
+    if (!ok && handle_out[0] && db.message_new_method_call) {
+        DBusMsg* cl = db.message_new_method_call(
+            "org.freedesktop.portal.Desktop", handle_out,
+            "org.freedesktop.portal.Request", "Close");
+        if (cl) {
+            DBusErr e2;
+            db.error_init(&e2);
+            DBusMsg* r2 = db.connection_send_with_reply_and_block(c, cl, 2000, &e2);
+            if (r2) db.message_unref(r2);
+            if (db.error_is_set(&e2)) db.error_free(&e2);
+            db.message_unref(cl);
+        }
+    }
+
     if (db.error_is_set(&err)) db.error_free(&err);
     db.connection_close(c);
     db.connection_unref(c);
@@ -1691,16 +1729,17 @@ uint8_t* plat_render_text(const char* s, int px_height, int* out_w, int* out_h) 
 const char* plat_capture_unavailable(void) {
     int op = 0, ev = 0, err = 0;
     if (XQueryExtension(dpy(), "XWAYLAND", &op, &ev, &err))
-        return "This is a Wayland session (XWayland). X11 capture comes back "
-               "black here -- the desktop is not in the X root window. Log out "
-               "and pick an Xorg session for capture to work.";
+        return "Wayland session: screenshots go through the desktop portal "
+               "(it will show its own picker). GIF and MP4 recording read the "
+               "X root window, which is empty here -- use an Xorg session to "
+               "record.";
 
     /* Secondary hint, for compositors that do not advertise the extension. */
     const char* t = getenv("XDG_SESSION_TYPE");
     const char* w = getenv("WAYLAND_DISPLAY");
     if ((t && strcasecmp(t, "wayland") == 0) || (w && w[0]))
-        return "This looks like a Wayland session. X11 capture comes back "
-               "black there -- log out and pick an Xorg session instead.";
+        return "Looks like a Wayland session: screenshots go through the "
+               "desktop portal. Recording needs an Xorg session.";
     return NULL;
 }
 

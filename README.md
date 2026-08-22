@@ -57,6 +57,42 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.9 — what a live Wayland desktop taught it
+
+3.8 was written against the portal and proven with a standalone test. Driving
+it through the actual program, on an actual Wayland laptop, found four things.
+
+**It provoked a crash in the desktop.** Abandoning a request by simply closing
+the D-Bus connection, while the compositor still had a picker open for it,
+segfaulted `xdg-desktop-portal-gnome` — `status=11/SEGV` in the journal. The
+spec provides `Request.Close()` for precisely this. Giving up quietly is not
+the same as giving up politely. With the close in place, the same abandoned
+request now leaves the portal running.
+
+**It trusted a Request path it had computed rather than the one it was
+given.** The portal is only *asked* to use our `handle_token` and may return a
+different path. Now the returned object path is used, the predicted one is
+kept as a fallback, and the match rule is not filtered on either.
+
+**It wrote seven bytes of a 255-byte path.** `snprintf(handle, sizeof handle, …)`
+where `handle` had become a `char*` — `sizeof` on a pointer. Caught by
+`-Wall`, which is the entire argument for keeping the build warning-clean.
+
+**And it called a perfectly good screenshot blank.** Every capture inherited
+the "this is probably black" warning added in 3.5, including the ones the
+portal had just handed over — the same dishonesty as silent black images,
+pointed the other way. The warning now follows the *source*: pixels read from
+the X root window can be blank, pixels from the portal cannot. The startup
+message changed too, from "log out and pick Xorg for capture to work" to what
+is now true — screenshots go through the portal; recording is what needs Xorg.
+
+Verified end to end on the laptop: F4 → GNOME's picker → a 598×391 region →
+saved to `Pictures/ORB_Recorder`, GNOME's own copy left untouched in
+`Pictures/Screenshots`, and the editor open on it. Mean 55925, 1138 colours.
+Not black.
+
+---
+
 ## New in 3.8 — screenshots work on Wayland
 
 3.5 made the program admit that X11 capture returns black on Wayland. This

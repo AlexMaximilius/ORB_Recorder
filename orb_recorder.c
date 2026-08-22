@@ -1088,7 +1088,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.8",
+    "ORB_RECORDER  v3.9",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -3962,7 +3962,21 @@ static void start_video_monitor(PlatMonitor m) {
  * pasted straight into a chat box, and the FILE goes on the clipboard too
  * so it can be pasted as an attachment. Then the folder is raised.       */
 
-static void save_screenshot(const uint8_t* rgba, int w, int h, const char* label) {
+/* from_x11 says whether these pixels came from reading the X root window --
+ * the one source that silently returns black under a Wayland compositor. A
+ * capture handed to us by the desktop portal is known good, and warning about
+ * it would be the same dishonesty as the black screenshots, pointed the other
+ * way. */
+static void save_screenshot_ex(const uint8_t* rgba, int w, int h,
+                               const char* label, bool from_x11);
+
+/* The ordinary route: pixels read off the X root window. */
+static void save_screenshot_x11(const uint8_t* rgba, int w, int h, const char* label) {
+    save_screenshot_ex(rgba, w, h, label, true);
+}
+
+static void save_screenshot_ex(const uint8_t* rgba, int w, int h,
+                               const char* label, bool from_x11) {
     if (!rgba || w <= 0 || h <= 0) { popup_mode("PNG", "EMPTY", "Nothing captured."); return; }
 
     char folder[512]; plat_get_output_dir(folder, sizeof folder);
@@ -3985,7 +3999,7 @@ static void save_screenshot(const uint8_t* rgba, int w, int h, const char* label
     plat_clipboard_copy_image(rgba, w, h);
     if (g.auto_clipboard) plat_clipboard_copy_file(path);
 
-    const char* why = plat_capture_unavailable();
+    const char* why = from_x11 ? plat_capture_unavailable() : NULL;
     log_write("shot", "%dx%d -> %s%s", w, h, path, why ? " (LIKELY BLANK)" : "");
     if (why) popup_mode("PNG", "PROBABLY BLANK", "%s", why);
     else     popup_mode("PNG", "SAVED", "Saved %dx%d to %s", w, h, path);
@@ -4052,7 +4066,7 @@ static void shot_delayed_job(void* arg) {
         if (mpx) {
             char mlabel[64];
             snprintf(mlabel, sizeof mlabel, "Menu_%dx%d", mw, mh);
-            save_screenshot(mpx, mw, mh, mlabel);
+            save_screenshot_x11(mpx, mw, mh, mlabel);
             free(mpx);
             log_write("shot", "delayed capture: menu %dx%d at (%d,%d)", mw, mh, mx, my);
             g_shot_pending = false;
@@ -4083,7 +4097,7 @@ static void shot_delayed_job(void* arg) {
         if (px) {
             char label[64];
             snprintf(label, sizeof label, "Screen_%dx%d", w, h);
-            save_screenshot(px, w, h, label);
+            save_screenshot_x11(px, w, h, label);
             free(px);
         } else {
             log_write("shot", "delayed capture failed");
@@ -4156,7 +4170,7 @@ static void portal_shot_job(void* arg) {
         g_shot_pending = false;
         return;
     }
-    save_screenshot(px, w, h, "Screen");
+    save_screenshot_ex(px, w, h, "Screen", false);
     free(px);
     g_shot_pending = false;
 }
@@ -4182,7 +4196,7 @@ static void handle_shot_region(void) {
     if (!px) { popup_mode("PNG", "FAILED", "Capture failed."); return; }
     char label[64];
     snprintf(label, sizeof label, "Shot_%dx%d", rw, rh);
-    save_screenshot(px, rw, rh, label);
+    save_screenshot_x11(px, rw, rh, label);
     free(px);
 }
 
@@ -4207,7 +4221,7 @@ static void shoot_window_handle(void* fg) {
     char label[64];
     sanitize_label(title[0] ? title : "window", label, sizeof label);
     if (strlen(label) > 48) label[48] = 0;
-    save_screenshot(px, sw, sh, label);
+    save_screenshot_x11(px, sw, sh, label);
     free(px);
 }
 
@@ -4579,8 +4593,8 @@ int main(int argc, char** argv) {
     {
         const char* why = plat_capture_unavailable();
         if (why) {
-            log_write("boot", "CAPTURE UNAVAILABLE: %s", why);
-            popup_mode("PNG", "NO CAPTURE", "%s", why);
+            log_write("boot", "%s", why);
+            popup_mode("PNG", "WAYLAND", "%s", why);
         }
     }
 
