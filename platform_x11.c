@@ -7,7 +7,9 @@
  *                    (fast, shared-memory image transfer). Rect for
  *                    per-window capture is computed from the target Window's
  *                    root-relative geometry.
- * Global hotkeys:    XGrabKey on the root window; polled via XCheckMaskEvent.
+ * Global hotkeys:    XGrabKey on the root window, polled with XCheckIfEvent
+ *                    so only grab-window deliveries are taken and ordinary
+ *                    keystrokes stay in the queue for GLFW.
  * Monitor enum:      XRandR (Xrandr_CrtcInfo). Falls back to single monitor
  *                    at (0,0, root_w, root_h) if XRandR isn't available.
  * Right-click menu:  spawns `yad --notification`-style is heavy; we render a
@@ -665,21 +667,45 @@ void plat_unregister_hotkey(int id) {
     XFlush(dpy());
 }
 
+static int hotkey_for_keycode(unsigned int kc) {
+    if (!kc) return 0;
+    if (g_f5_kc  && kc == g_f5_kc)  return PLAT_HK_F5;
+    if (g_esc_kc && kc == g_esc_kc) return PLAT_HK_ESCAPE;
+    if (g_f6_kc  && kc == g_f6_kc)  return PLAT_HK_F6;
+    if (g_f7_kc  && kc == g_f7_kc)  return PLAT_HK_F7;
+    if (g_f8_kc  && kc == g_f8_kc)  return PLAT_HK_F8;
+    if (g_f9_kc  && kc == g_f9_kc)  return PLAT_HK_F9;
+    if (g_f4_kc  && kc == g_f4_kc)  return PLAT_HK_F4;
+    if (g_prt_kc && kc == g_prt_kc) return PLAT_HK_PRTSC;
+    return 0;
+}
+
+/* Take ONLY the grabbed keys, and leave everything else where it was.
+ *
+ * This used to be XCheckMaskEvent(KeyPressMask), which pulls every KeyPress
+ * off the connection -- including the ones on their way to our own windows,
+ * because GLFW shares this display -- and dropped anything that was not a
+ * registered hotkey. So no key could ever be typed: the editor's tool
+ * shortcuts, Ctrl+S and the whole text tool were silently inert while the
+ * mouse worked perfectly.
+ *
+ * That is exactly the Windows bug fixed in 2.1, with the roles reversed.
+ * There a foreign message pump ate our WM_HOTKEY; here we were the thief.
+ *
+ * XGrabKey delivers to its grab window -- the root -- so the event's window
+ * field is what separates a hotkey from an ordinary keystroke. XCheckIfEvent
+ * removes only what the predicate accepts and disturbs nothing else. */
+static Bool grabbed_key_only(Display* d, XEvent* ev, XPointer arg) {
+    (void)arg;
+    if (ev->type != KeyPress) return False;
+    if (ev->xkey.window != DefaultRootWindow(d)) return False;
+    return hotkey_for_keycode(ev->xkey.keycode) ? True : False;
+}
+
 int plat_poll_hotkey(void) {
     XEvent ev;
-    while (XCheckMaskEvent(dpy(), KeyPressMask, &ev)) {
-        if (ev.type == KeyPress) {
-            if (g_f5_kc  && ev.xkey.keycode == g_f5_kc)  return PLAT_HK_F5;
-            if (g_esc_kc && ev.xkey.keycode == g_esc_kc) return PLAT_HK_ESCAPE;
-            if (g_f6_kc  && ev.xkey.keycode == g_f6_kc)  return PLAT_HK_F6;
-            if (g_f7_kc  && ev.xkey.keycode == g_f7_kc)  return PLAT_HK_F7;
-            if (g_f8_kc  && ev.xkey.keycode == g_f8_kc)  return PLAT_HK_F8;
-            if (g_f9_kc  && ev.xkey.keycode == g_f9_kc)  return PLAT_HK_F9;
-            if (g_f4_kc  && ev.xkey.keycode == g_f4_kc)  return PLAT_HK_F4;
-            if (g_prt_kc && ev.xkey.keycode == g_prt_kc) return PLAT_HK_PRTSC;
-            if (g_f8_kc  && ev.xkey.keycode == g_f8_kc)  return PLAT_HK_F8;
-        }
-    }
+    if (XCheckIfEvent(dpy(), &ev, grabbed_key_only, NULL))
+        return hotkey_for_keycode(ev.xkey.keycode);
     return 0;
 }
 

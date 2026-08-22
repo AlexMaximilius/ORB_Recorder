@@ -57,6 +57,48 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.4 — it runs on Linux
+
+![ORB_Recorder on Ubuntu](media/linux.png)
+
+Not "compiles on Linux" — *runs*. Ubuntu 24.04, X11, software GL: the orb
+draws, F4 grabs a region, the capture is written as a PNG, and the editor
+opens on it. Everything above is that machine.
+
+Three bugs were waiting there, and one of them was on Windows all along.
+
+**Nothing could be typed on X11.** Hotkey polling used
+`XCheckMaskEvent(KeyPressMask)`, which pulls *every* key press off the
+connection — including the ones on their way to our own windows, because GLFW
+shares that connection — and discarded anything that was not a registered
+hotkey. The mouse worked perfectly, so the editor looked fine until you tried
+to press a key. It now takes only events delivered to the grab window, and
+leaves the rest where they were. That is the Windows bug from 2.1 exactly
+inverted: there a foreign message pump ate our hotkeys, here we were the
+thief.
+
+**The boot settle loop was comparing against the wrong formula** — the orb's
+offset inside its window is `(window - orb) / 2`, not `orb`. The window was
+always precisely where it belonged and this declared it drifted, every frame,
+for the whole settle period. Harmless except that it buried the boot log: a
+Windows start wrote hundreds of "window drifted" lines, and now writes none.
+It took a display with no window manager for the numbers to be odd enough to
+look at.
+
+**Three silent truncations**, flagged by GCC 13 where MinGW had never
+mentioned them. One mattered: the path handed to the editor was held in a
+buffer smaller than the path itself, so a long enough filename would have
+opened the editor on the wrong file.
+
+`glfwInit` failing also used to report "no display?" whatever the cause. It
+now asks GLFW and prints what actually happened — a missing GLX extension, a
+driver that cannot make a context and an unreachable X server are three
+different problems, and they all looked identical.
+
+Both platforms now build with **zero warnings**.
+
+---
+
 ## New in 3.3 — the editor stops losing things
 
 **The browse chevrons only appear when you are browsing.** They sit down each
@@ -327,12 +369,22 @@ overhanging the right edge must not wrap onto the next row.
 Both failure modes were confirmed by breaking the code on purpose and watching
 the suite name the cause — a test that has never failed is decoration.
 
-> **Platform status, stated plainly.** Windows is the developed and tested
-> target. The Linux build compiles clean but has only ever been built on a
-> headless machine — every X11 path (XShm capture, XGrabKey, `_NET_WM_STATE`,
-> XShape regions, the zenity menu) is **written and unexercised**. Video and
-> camera are Windows-only; Linux reports them unavailable rather than
-> pretending. Expect to fix things.
+> **Platform status, stated plainly.** Windows is the developed and daily-used
+> target. As of 3.4 the Linux build has actually been **run against an X
+> display** rather than merely compiled, on Ubuntu 24.04 under Xvfb with
+> software GL.
+>
+> *Verified there:* the orb renders (shaped window, GL, transparency), global
+> hotkeys via XGrabKey, the region selector, X11 screen capture, PNG output,
+> and the whole annotation editor — mouse drawing, tool and colour keys, typed
+> text, `Ctrl+S`. Format enumeration through gdk-pixbuf reports 27 decoders.
+> The test suite passes with byte-identical output to Windows.
+>
+> *Still unexercised:* a real window manager — Xvfb has none, so always-on-top,
+> the tray and taskbar behaviour, and drag-and-drop onto the orb are untested.
+> So are the zenity right-click menu, the clipboard (`xclip`/`wl-copy`), and a
+> hardware GL driver. Video and camera remain Windows-only; Linux reports them
+> unavailable rather than pretending. Expect to fix things — but it works.
 
 ```
 orb_recorder.c          core: orb, capture loop, editor, viewer

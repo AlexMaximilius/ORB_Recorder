@@ -157,7 +157,7 @@ typedef struct {
      * saves from a background thread, and creating a window off the main
      * thread is undefined behaviour in GLFW on every platform -- so the path
      * is parked here and opened where windows are allowed to be made. */
-    char pending_edit[600];
+    char pending_edit[700];   /* sized to match save_screenshot's path[] */
     bool tray_only;               /* hide taskbar button, use notification area */
     int  audio_src;               /* PLAT_AUDIO_* for video recording */
     bool dbl_video;               /* double-click arms MP4 rather than GIF */
@@ -426,7 +426,9 @@ static void settings_load(void) {
         if (line[0] == '#' || line[0] == '\n') continue;
         /* String-valued keys first. */
         if (!strncmp(line, "orb_mon=", 8)) {
-            snprintf(g.anchor_mon, sizeof g.anchor_mon, "%s", line + 8);
+            if (snprintf(g.anchor_mon, sizeof g.anchor_mon, "%s", line + 8)
+                    >= (int)sizeof g.anchor_mon)
+                g.anchor_mon[0] = 0;   /* a half id might match the wrong screen */
             for (char* c = g.anchor_mon; *c; c++)
                 if (*c == '\n' || *c == '\r') { *c = 0; break; }
             continue;
@@ -965,11 +967,34 @@ static void build_record_path(void) {
     time_t tt = time(NULL);
     struct tm lt = *localtime(&tt);
     const char* label = g.record_label[0] ? g.record_label : "gif_orb";
-    snprintf(g.record_path, sizeof g.record_path,
+    int need = snprintf(g.record_path, sizeof g.record_path,
              "%s/%s_%04d%02d%02d_%02d%02d%02d.gif",
              folder, label,
              lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
              lt.tm_hour, lt.tm_min, lt.tm_sec);
+    if (need >= (int)sizeof g.record_path) {
+        /* Fall back to a name that always fits rather than writing to a
+         * silently truncated path -- which on Windows can still open, at the
+         * wrong name, in the wrong place. */
+        log_write("save", "output path too long (%d chars); using a short name", need);
+        /* Trim the FOLDER and nothing else, with the arithmetic written out
+         * rather than left for the compiler to infer. snprintf-into-snprintf
+         * says "this may truncate" at every step, which is true and is the
+         * whole intent -- so say where the cut happens instead. */
+        char ts[24];
+        /* The %% keeps each field inside its stated width, so the total
+         * length is a fact rather than an assumption -- tm fields are plain
+         * ints and nothing else here promises they are small. */
+        snprintf(ts, sizeof ts, "%04d%02d%02d_%02d%02d%02d",
+                 (lt.tm_year + 1900) % 10000, (lt.tm_mon + 1) % 100,
+                 lt.tm_mday % 100, lt.tm_hour % 100,
+                 lt.tm_min % 100, lt.tm_sec % 100);
+        size_t keep = strlen(folder);
+        if (keep > sizeof g.record_path - 64) keep = sizeof g.record_path - 64;
+        memcpy(g.record_path, folder, keep);
+        snprintf(g.record_path + keep, sizeof g.record_path - keep,
+                 "/capture_%s.gif", ts);
+    }
 }
 
 /* Video: same targeting and same capture path as GIF, different encoder.
@@ -1063,7 +1088,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.3",
+    "ORB_RECORDER  v3.4",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -3305,6 +3330,16 @@ static void on_scroll(GLFWwindow* win, double dx, double dy) {
     popup("SIZE", "Orb %d px (scroll over it to resize).", g.orb_size);
 }
 
+/* Last error GLFW reported. Kept rather than printed on the spot, because
+ * the useful moment to say it is when the call that provoked it fails. */
+static char g_glfw_err[256];
+
+static void on_glfw_error(int code, const char* desc) {
+    snprintf(g_glfw_err, sizeof g_glfw_err, "%s (GLFW error %d)",
+             desc ? desc : "unknown", code);
+    log_write("glfw", "%s", g_glfw_err);
+}
+
 static void on_key(GLFWwindow* win, int key, int sc, int action, int mods) {
     (void)win; (void)sc;
     if (key == GLFW_KEY_F1 && action == GLFW_PRESS) { help_open(); return; }
@@ -3962,7 +3997,13 @@ static void save_screenshot(const uint8_t* rgba, int w, int h, const char* label
      * went. Every screenshot route ends up here, so region, window and the
      * delayed whole-screen capture all behave the same way. */
     if (g.shot_editor == 1) {
-        snprintf(g.pending_edit, sizeof g.pending_edit, "%s", path);
+        /* Truncating here would open the editor on a different file --
+         * or on nothing -- so refuse rather than guess. */
+        if (snprintf(g.pending_edit, sizeof g.pending_edit, "%s", path)
+                >= (int)sizeof g.pending_edit) {
+            g.pending_edit[0] = 0;
+            log_write("shot", "path too long to hand to the editor: %s", path);
+        }
     } else if (g.shot_editor == 2) {
         if (!plat_open_in_editor(path))
             log_write("shot", "no image editor could be launched for %s", path);
@@ -4322,9 +4363,20 @@ int main(int argc, char** argv) {
                   nfmt, g_img_exts[0] ? g_img_exts : "(none)");
     }
 
+    /* GLFW knows exactly why it failed. Ask it, rather than guessing.
+     *
+     * This used to say "no display?" whatever happened -- the right guess on a
+     * headless box and useless everywhere else. A missing GLX extension, a
+     * driver that cannot create a context, and an unreachable X server are
+     * three different problems with three different fixes, and they all
+     * looked identical from here. */
+    glfwSetErrorCallback(on_glfw_error);
+
     if (!glfwInit()) {
-        log_write("boot", "glfwInit failed (no display?)");
-        fprintf(stderr, "glfwInit failed -- no display?\n");
+        log_write("boot", "glfwInit failed: %s",
+                  g_glfw_err[0] ? g_glfw_err : "no reason given");
+        fprintf(stderr, "glfwInit failed: %s\n",
+                g_glfw_err[0] ? g_glfw_err : "no reason given");
         log_close();
         return 1;
     }
@@ -4546,11 +4598,22 @@ int main(int argc, char** argv) {
 
         if (settle_until && plat_now_ms() < settle_until) {
             if (!g.isDragging) {
-                int wx, wy;
+                int wx, wy, want_x, want_y;
                 glfwGetWindowPos(g.window, &wx, &wy);
-                if (wx != settle_x - g.orb_size || wy != settle_y - g.orb_size) {
-                    log_write("boot", "window drifted to (%d,%d) -- re-asserting "
-                              "orb (%d,%d)", wx, wy, settle_x, settle_y);
+                /* Ask the same function that placed it. This used to open-code
+                 * `settle_x - g.orb_size`, which is exactly the formula that
+                 * orb_sync_from_window's comment warns about: the window is a
+                 * fixed size, so the inset depends on the orb size rather than
+                 * being the orb size. The window was always precisely where it
+                 * belonged and this declared it drifted, every frame, for the
+                 * whole settle period, on both platforms. Harmless apart from
+                 * burying the boot log -- which is where it was finally
+                 * noticed, on a display with no window manager at all. */
+                orb_window_pos(settle_x, settle_y, &want_x, &want_y);
+                if (wx != want_x || wy != want_y) {
+                    log_write("boot", "window at (%d,%d), wanted (%d,%d)"
+                              " -- re-asserting orb (%d,%d)",
+                              wx, wy, want_x, want_y, settle_x, settle_y);
                     g.orb_x = settle_x; g.orb_y = settle_y;
                     orb_move_to(settle_x, settle_y);
                 }
@@ -4561,7 +4624,7 @@ int main(int argc, char** argv) {
         }
 
         if (g.pending_edit[0]) {
-            char open_me[600];
+            char open_me[sizeof g.pending_edit];
             snprintf(open_me, sizeof open_me, "%s", g.pending_edit);
             g.pending_edit[0] = 0;
             if (ed_open_path(open_me)) g.ed_browsing = false;
