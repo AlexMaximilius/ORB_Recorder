@@ -146,6 +146,10 @@ typedef struct {
     bool hotkey_on[PLAT_HK_COUNT];
     bool auto_open_folder;
     bool auto_clipboard;
+    /* A screenshot is almost never finished at the moment it is taken --
+     * something in it wants circling, cropping or blanking out. Handing it
+     * straight to an editor removes the step everybody does by hand. */
+    bool edit_shots;
     bool tray_only;               /* hide taskbar button, use notification area */
     int  audio_src;               /* PLAT_AUDIO_* for video recording */
     bool dbl_video;               /* double-click arms MP4 rather than GIF */
@@ -375,6 +379,7 @@ static void settings_save(void) {
         fprintf(f, "hk_%s=%d\n", HK_NAMES[i], g.hotkey_on[i] ? 1 : 0);
     fprintf(f, "auto_open=%d\n", g.auto_open_folder ? 1 : 0);
     fprintf(f, "auto_clip=%d\n", g.auto_clipboard ? 1 : 0);
+    fprintf(f, "edit_shots=%d\n", g.edit_shots ? 1 : 0);
     fprintf(f, "tray_only=%d\n", g.tray_only ? 1 : 0);
     fprintf(f, "orb_hidden=%d\n", g_orb_hidden ? 1 : 0);
     fprintf(f, "audio_src=%d\n", g.audio_src);
@@ -443,6 +448,7 @@ static void settings_load(void) {
         else if (!strcmp(key, "orb_fx"))    { g.anchor_fx = val; g.have_anchor = true; }
         else if (!strcmp(key, "orb_fy"))    { g.anchor_fy = val; }
         else if (!strcmp(key, "auto_clip")) { g.auto_clipboard = val != 0; }
+        else if (!strcmp(key, "edit_shots")) { g.edit_shots = val != 0; }
         else if (!strcmp(key, "tray_only")) { g.tray_only = val != 0; }
         else if (!strcmp(key, "orb_hidden")) { g_orb_hidden = val != 0; }
         else if (!strcmp(key, "dbl_video")) { g.dbl_video = val != 0; }
@@ -1037,7 +1043,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v2.1",
+    "ORB_RECORDER  v3.0",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1047,6 +1053,7 @@ static const char* HELP_LINES[] = {
     "  F4 / PRTSC      SCREENSHOT A REGION -> PNG",
     "  HIDE ORB        RIGHT-CLICK MENU; TRAY ICON BRINGS IT BACK",
     "  DELAYED SHOT    RIGHT-CLICK MENU; THE ONLY WAY TO CAPTURE A MENU",
+    "  EVERY SHOT      OPENS IN PAINT + THE FOLDER (RIGHT-CLICK TO STOP)",
     "  F5              RECORD THE FOCUSED WINDOW / STOP",
     "  F6              DRAG A REGION, RECORD IT / STOP",
     "  F7              RECORD VIDEO + SOUND, WINDOW / STOP",
@@ -2716,6 +2723,7 @@ static PlatMenuState menu_state(void) {
     for (int i = 0; i < PLAT_HK_COUNT; i++) st.hotkey_on[i] = g.hotkey_on[i];
     st.auto_open = g.auto_open_folder;
     st.auto_clip = g.auto_clipboard;
+    st.edit_shots = g.edit_shots;
     st.tray_only = g.tray_only;
     st.audio_src = g.audio_src;
     st.dbl_video = g.dbl_video;
@@ -2811,6 +2819,12 @@ static void handle_menu_command(int cmd) {
         g.auto_open_folder = !g.auto_open_folder;
         popup(g.auto_open_folder ? "OPEN ON" : "OPEN OFF",
               "Auto-open folder: %s", g.auto_open_folder ? "ON" : "OFF");
+        settings_mark_dirty();
+    } else if (cmd == PLAT_MENU_TOGGLE_PAINT) {
+        g.edit_shots = !g.edit_shots;
+        popup_mode("PNG", g.edit_shots ? "PAINT ON" : "PAINT OFF",
+                   "Screenshots %s open in the image editor.",
+                   g.edit_shots ? "now" : "no longer");
         settings_mark_dirty();
     } else if (cmd == PLAT_MENU_OPEN_EDITOR) {
         char pick[512];
@@ -3120,6 +3134,13 @@ static void save_screenshot(const uint8_t* rgba, int w, int h, const char* label
     /* Raise the folder. plat_open_folder_select reuses a window already
      * showing it rather than stacking up a new one each time. */
     if (g.auto_open_folder) plat_open_folder_select(path);
+
+    /* Then the editor, last, so it lands on top of the folder rather than
+     * under it -- the shot is what you came for; the folder is where it
+     * went. Every screenshot route ends up here, so region, window and the
+     * delayed whole-screen capture all behave the same way. */
+    if (g.edit_shots && !plat_open_in_editor(path))
+        log_write("shot", "no image editor could be launched for %s", path);
 }
 
 /* F4: drag a rectangle, get a PNG. */
@@ -3459,6 +3480,7 @@ int main(int argc, char** argv) {
     g.hotkey_on[0] = true;
     g.auto_open_folder = true;
     g.auto_clipboard = true;
+    g.edit_shots     = true;
     g.audio_src      = PLAT_AUDIO_SYSTEM;   /* settings_load may override */
     for (int i = 0; i < PLAT_HK_COUNT; i++) g.hotkey_on[i] = true;
     g.gw_open = false;

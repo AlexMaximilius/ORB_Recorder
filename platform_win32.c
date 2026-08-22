@@ -864,6 +864,8 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                 PLAT_MENU_TOGGLE_AUTOOPEN, "Open folder after saving");
     AppendMenuA(root, MF_STRING | (st->auto_clip ? MF_CHECKED : MF_UNCHECKED),
                 PLAT_MENU_TOGGLE_CLIP,     "Copy file to clipboard");
+    AppendMenuA(root, MF_STRING | (st->edit_shots ? MF_CHECKED : MF_UNCHECKED),
+                PLAT_MENU_TOGGLE_PAINT,    "Open screenshots in Paint");
     AppendMenuA(root, MF_STRING | (st->tray_only ? MF_CHECKED : MF_UNCHECKED),
                 PLAT_MENU_TOGGLE_TRAY,     "Tray icon only");
     AppendMenuA(root, MF_STRING, PLAT_MENU_HIDE_ORB,
@@ -1225,6 +1227,27 @@ void plat_open_with_default_app(const char* path) {
  * Also ShellExecute needs COM initialized on the calling thread; when we
  * hop in here from a background thread the thread trampoline handles it.
  */
+bool plat_open_in_editor(const char* path) {
+    char norm[MAX_PATH];
+    size_t n = strlen(path);
+    if (n >= sizeof norm) n = sizeof norm - 1;
+    for (size_t i = 0; i < n; i++) norm[i] = (path[i] == '/') ? '\\' : path[i];
+    norm[n] = 0;
+
+    /* Whatever this machine associates with EDITING an image -- Paint on a
+     * stock install, Paint.NET or GIMP or Photoshop if the user said so. */
+    HINSTANCE r = ShellExecuteA(NULL, "edit", norm, NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)r > 32) return true;
+
+    /* No edit verb registered for this type -- ask for Paint by name rather
+     * than give up. It is not always on the PATH, but it has an App Paths
+     * registry entry, which is what ShellExecute resolves names through. */
+    char arg[MAX_PATH + 4];
+    snprintf(arg, sizeof arg, "\"%s\"", norm);   /* spaces in the path */
+    r = ShellExecuteA(NULL, "open", "mspaint.exe", arg, NULL, SW_SHOWNORMAL);
+    return (INT_PTR)r > 32;
+}
+
 void plat_open_folder_select(const char* file_path) {
     char norm[MAX_PATH];
     size_t n = strlen(file_path);

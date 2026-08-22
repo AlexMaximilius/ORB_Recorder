@@ -161,6 +161,7 @@ enum {
     PLAT_MENU_SHOT_DELAY_5    = 148,   /* the monitor under the cursor, after 5s */
     PLAT_MENU_RUN_AT_STARTUP  = 145,   /* launch when the user logs in     */
     PLAT_MENU_HIDE_ORB        = 146,   /* hide the orb; tray is the way back */
+    PLAT_MENU_TOGGLE_PAINT    = 150,   /* open screenshots in an image editor */
     PLAT_MENU_MONITOR_BASE    = 200,   /* GIF:   + monitor index */
     PLAT_MENU_VMONITOR_BASE   = 300,   /* VIDEO: + monitor index */
     PLAT_MENU_CAMERA_BASE     = 400    /* CAMERA: + device index */
@@ -173,6 +174,7 @@ typedef struct {
     bool hotkey_on[PLAT_HK_COUNT];   /* 0=F5 1=F6 2=F7 3=F8 4=F9 5=F4 6=PrtSc */
     bool auto_open;
     bool auto_clip;
+    bool edit_shots;     /* hand a new screenshot to the image editor */
     bool tray_only;
     int  audio_src;
     bool dbl_video;      /* double-click arms MP4 rather than GIF */
@@ -207,6 +209,19 @@ int plat_list_image_extensions(char* out, size_t sz);
 
 /* ---- reveal a file in the OS file explorer ---------------------------- */
 void plat_open_folder_select(const char* file_path);
+
+/* Hand a saved image to the system's image EDITOR, which is not the same
+ * thing as its viewer.
+ *
+ * Double-clicking a .png on Windows gets you Photos: no pen, no crop, no
+ * arrow, nothing you actually want thirty seconds after taking a
+ * screenshot. The shell has kept a separate "edit" verb for precisely this
+ * distinction since Windows 95, and on a stock box it resolves to Paint --
+ * or to whatever the user has since chosen for editing images, which is the
+ * better answer and comes free.
+ *
+ * Returns false if nothing could be launched. */
+bool plat_open_in_editor(const char* path);
 
 /* ---- copy a file path onto the clipboard as a file drop (CF_HDROP) ----
  * After this, Ctrl-V in Slack / Discord / GitHub / Explorer attaches the file. */

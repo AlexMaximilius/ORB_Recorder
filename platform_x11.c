@@ -1150,6 +1150,32 @@ void plat_clipboard_copy_file(const char* file_path) {
     fprintf(stderr, "[gif_orb] clipboard copy unavailable: install xclip or wl-copy.\n");
 }
 
+bool plat_open_in_editor(const char* path) {
+    /* There is no "edit" verb in the freedesktop world -- xdg-open hands a
+     * PNG to the default handler, which is a viewer. So ask for an editor by
+     * name, in the order a desktop is likely to have one, and only fall back
+     * to xdg-open so that SOMETHING opens rather than nothing happening. */
+    static const char* ED[] = { "pinta", "kolourpaint", "drawing", "krita",
+                                "gimp", "mtpaint", NULL };
+    const char* chosen = NULL;
+    for (int i = 0; ED[i]; i++) {
+        char* p = which(ED[i]);
+        if (p) { chosen = ED[i]; free(p); break; }
+    }
+    if (!chosen) {
+        char* x = which("xdg-open");
+        if (!x) return false;
+        free(x);
+        chosen = "xdg-open";
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp(chosen, chosen, path, (char*)NULL);
+        _exit(1);
+    }
+    return pid > 0;                 /* parent: don't wait */
+}
+
 /* ---- reveal file ------------------------------------------------------ */
 void plat_open_folder_select(const char* file_path) {
     /* xdg-open opens the parent dir; there's no cross-DE "select file" verb.

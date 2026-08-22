@@ -30,7 +30,7 @@ corner of the same monitor even if that monitor was asleep at boot.
 
 | key | does |
 |---|---|
-| **F4** / **PrintScreen** | drag a rectangle → **PNG**, on the clipboard, folder opens |
+| **F4** / **PrintScreen** | drag a rectangle → **PNG**, on the clipboard, opens in Paint |
 | **F5** | record the focused window → GIF |
 | **F6** | drag a region → GIF |
 | **F7** | record the focused window → MP4 with sound |
@@ -54,6 +54,25 @@ viewer. Videos open in your default player.
 
 Colour is state: orange idle, yellow armed, **red recording GIF**, **magenta
 recording video**, **cyan recording camera**, green editing.
+
+---
+
+## New in 3.0
+
+**Every screenshot opens in Paint, and in its folder.** A screenshot is
+almost never finished at the moment it is taken — something in it wants
+circling, cropping, or blanking out — so the shot now arrives in an image
+editor with the folder behind it, on top of already being on the clipboard.
+Region, window and delayed captures all behave the same way. Uncheck *Open
+screenshots in Paint* in the right-click menu if you'd rather it didn't.
+
+Not hardcoded to Paint: it asks the shell for the **`edit` verb**, which is a
+different thing from `open`. Double-clicking a `.png` gets you a viewer;
+`edit` gets you whatever the machine uses for editing images — Paint out of
+the box, Paint.NET or GIMP or Photoshop if you've said so, and no change here
+when you change your mind. Where no edit verb is registered at all, Paint is
+asked for by name rather than nothing happening. On Linux there is no such
+verb, so it looks for a real editor first and only falls back to `xdg-open`.
 
 ---
 
@@ -210,7 +229,7 @@ dialog box.
 ## Prior art / defensive publication
 
 **Written by Alex Maximilius ("Alex Maz"). Published 2026-08-15 and
-dedicated to the public domain by its copyright holder.** Items 13–15 were
+dedicated to the public domain by its copyright holder.** Items 13–16 were
 added 2026-08-21 and are published as of that date.
 
 This section exists so the design described here **cannot be patented by
@@ -271,6 +290,11 @@ automatically.
     loop, so that it fires on schedule while the user interface thread is
     inside a modal loop — capturing transient interface elements (menus,
     tooltips, drag states) that any keystroke would dismiss.
+16. Delivering a freshly captured image to the operating system's registered
+    **editor** association rather than its viewer association, automatically
+    and as part of the capture, so that the capture arrives in something that
+    can annotate it; including doing so alongside placing the same capture on
+    the clipboard and revealing it in its containing folder.
 
 **Also disclosed, as obvious extensions:** any other shape in place of a
 circle; any other colour scheme or use of motion, size, opacity or sound to
