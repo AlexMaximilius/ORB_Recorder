@@ -57,6 +57,42 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.8 — screenshots work on Wayland
+
+3.5 made the program admit that X11 capture returns black on Wayland. This
+makes it work instead, through `xdg-desktop-portal` — the route the desktop
+sanctions, rather than one it is designed to prevent.
+
+`libdbus-1` is **`dlopen`'d, not linked**, exactly like gdk-pixbuf: no portal
+or no D-Bus means one fewer feature, never a binary that will not start. The
+D-Bus headers are not needed either — the handful of types used are opaque
+pointers and one deliberately oversized scratch buffer.
+
+**It asks for the compositor's own picker, and that is the design rather than
+a workaround.** The first version requested `interactive: false` — the whole
+screen, silently, to be cropped afterwards in our editor. GNOME refused it ten
+times out of ten, and is right to: a silent full-screen grab by a program the
+desktop cannot identify is the exact thing the portal exists to stop. Asking
+for the picker also returns a **region**, which is what F4 wanted in the first
+place. So on Wayland the compositor's selector stands in for ours, and the
+result lands in our editor exactly as before — clipboard, folder, annotation
+tools, all unchanged.
+
+It runs on a background thread, because a permission dialog can sit on screen
+for as long as the user takes to read it and the orb must not freeze behind
+it. That is the zenity lesson from 3.7, applied before it could bite twice.
+
+**It does not delete your screenshot.** GNOME saves the capture to
+`~/Pictures/Screenshots` and hands back that path — the user's own file, in
+the folder they expect. The first version removed the portal's file after
+reading it, which would have quietly destroyed it. It now only removes files
+left in `/tmp` or `XDG_RUNTIME_DIR`, and logs where the desktop kept its copy.
+
+Recording — GIF and MP4 — still needs `ScreenCast` over PipeWire and remains
+Windows-and-Xorg only. That is a real dependency and a separate project.
+
+---
+
 ## New in 3.7 — the Linux right-click menu is a menu
 
 ![The right-click menu on Ubuntu](media/linux_menu.png)
@@ -461,10 +497,10 @@ the suite name the cause — a test that has never failed is decoration.
 > As of 3.5 it has also run on a **GNOME laptop with a real window manager**,
 > where the orb is placed correctly via override-redirect and hotkeys fire.
 >
-> **On Wayland, capture does not work and the program says so.** X11 capture
-> reads the X root window, and under a Wayland compositor that is not the
-> desktop — the result is black. Log out and choose an Xorg session, or use
-> Windows, until portal/PipeWire capture exists.
+> **On Wayland, screenshots go through the desktop portal** (3.8): the
+> compositor shows its own picker and hands back the region. Recording — GIF
+> and MP4 — still reads the X root window, which a Wayland compositor does not
+> fill, so that remains Xorg-only and says so.
 >
 > The right-click menu, capture, the editor and the hotkeys have all been
 > driven on that machine.

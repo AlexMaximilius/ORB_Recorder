@@ -1088,7 +1088,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.7",
+    "ORB_RECORDER  v3.8",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -4113,7 +4113,65 @@ static void shot_delayed_start(int seconds) {
     plat_run_background(shot_delayed_job, j);
 }
 
+/* Wayland's route to a screenshot.
+ *
+ * The portal returns a whole screen as a PNG on disk, so the region selector
+ * cannot come first -- there is nothing to select over until the picture
+ * exists. It goes through save_screenshot like every other capture, which
+ * means clipboard, folder and the editor all behave identically, and the crop
+ * tool is waiting there for the region you actually wanted.
+ *
+ * On a background thread: the portal may be showing a permission dialog, and
+ * the orb has to keep running while the user reads it. */
+static void portal_shot_job(void* arg) {
+    (void)arg;
+    char png[700] = {0};
+    if (!plat_portal_screenshot(png, sizeof png)) {
+        log_write("shot", "portal screenshot unavailable or declined");
+        popup_mode("PNG", "NO PORTAL",
+                   "The desktop portal did not provide a screenshot.");
+        g_shot_pending = false;
+        return;
+    }
+    int w = 0, h = 0, comp = 0;
+    uint8_t* px = stbi_load(png, &w, &h, &comp, 4);
+
+    /* Delete the portal's file ONLY if it left it somewhere temporary.
+     *
+     * GNOME's interactive screenshot saves into ~/Pictures/Screenshots and
+     * hands back that path -- it is the user's own screenshot, in the folder
+     * they expect to find it, not scratch space. The first version removed it
+     * unconditionally, which would have quietly deleted a file the desktop
+     * had just saved on their behalf. Two copies is untidy; destroying
+     * somebody's screenshot is not untidy, it is data loss. */
+    if (!strncmp(png, "/tmp/", 5) ||
+        (getenv("XDG_RUNTIME_DIR") &&
+         !strncmp(png, getenv("XDG_RUNTIME_DIR"), strlen(getenv("XDG_RUNTIME_DIR")))))
+        remove(png);
+    else
+        log_write("shot", "the desktop also kept its own copy at %s", png);
+    if (!px) {
+        log_write("shot", "portal returned %s but it would not decode", png);
+        popup_mode("PNG", "FAILED", "The portal's image could not be read.");
+        g_shot_pending = false;
+        return;
+    }
+    save_screenshot(px, w, h, "Screen");
+    free(px);
+    g_shot_pending = false;
+}
+
 static void handle_shot_region(void) {
+    /* Where the X server cannot show us the desktop, dragging a rectangle
+     * over it would only select part of a black image. Go through the portal
+     * and let the editor do the cropping. */
+    if (plat_capture_unavailable()) {
+        if (g_shot_pending) return;
+        g_shot_pending = true;
+        popup_mode("PNG", "PORTAL", "Asking the desktop for a screenshot...");
+        plat_run_background(portal_shot_job, NULL);
+        return;
+    }
     if (g.state == ORB_RECORDING) { popup_mode("PNG", "BUSY", "Stop recording first."); return; }
     int rx, ry, rw, rh;
     if (!region_select(&rx, &ry, &rw, &rh)) {

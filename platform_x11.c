@@ -60,6 +60,7 @@
 #include <dlfcn.h>
 #include <dirent.h>
 #include <strings.h>
+#include <ctype.h>
 
 #include "platform.h"
 
@@ -997,6 +998,280 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
     XFreeFont(d, fnt);
     XFlush(d);
     return chosen;
+}
+
+
+/* ---- Wayland screenshots, via xdg-desktop-portal ----------------------
+ *
+ * On a Wayland session the X root window is not the desktop, so XShmGetImage
+ * returns black. The compositor will not let any client read the screen
+ * directly -- that is the entire point of the design -- and the sanctioned
+ * route is the portal: a D-Bus service that takes the picture on our behalf,
+ * after asking the user once whether that is allowed.
+ *
+ * org.freedesktop.portal.Screenshot hands back a whole screen as a PNG on
+ * disk. There is no region variant, which suits this program: the capture
+ * lands in the built-in editor and the crop tool is already there.
+ *
+ * libdbus is dlopen'd rather than linked, exactly like gdk-pixbuf above, so
+ * the binary still runs on a machine without it -- one fewer feature, not a
+ * failure to start. The headers are not needed either; the few types used
+ * here are opaque pointers and the iterator is a fixed-size scratch buffer
+ * that libdbus writes into, deliberately oversized.
+ *
+ * The call is asynchronous by design: Screenshot() returns a Request object
+ * path, and the answer arrives later as a Response signal on it. The match
+ * rule goes on BEFORE the call, or a fast compositor can answer before we are
+ * listening. The whole thing runs on a background thread, because the user
+ * may be looking at a permission dialog and the orb must not freeze while
+ * they decide -- which is the mistake the zenity menu made.
+ */
+
+typedef struct DBusConnectionOpaque DBusConn;
+typedef struct DBusMessageOpaque    DBusMsg;
+typedef struct { void* pad[16]; } DBusIter;    /* real one is ~80 bytes */
+typedef struct { void* pad[8];  } DBusErr;     /* real one is ~32 bytes */
+
+#define DB_TYPE_INVALID     0
+#define DB_TYPE_BOOLEAN     'b'
+#define DB_TYPE_STRING      's'
+#define DB_TYPE_UINT32      'u'
+#define DB_TYPE_ARRAY       'a'
+#define DB_TYPE_VARIANT     'v'
+#define DB_TYPE_DICT_ENTRY  'e'
+#define DB_TYPE_OBJECT_PATH 'o'
+#define DB_BUS_SESSION      0
+
+static struct {
+    void* lib;
+    int   tried;
+    void        (*error_init)(DBusErr*);
+    int         (*error_is_set)(const DBusErr*);
+    void        (*error_free)(DBusErr*);
+    DBusConn*   (*bus_get_private)(int, DBusErr*);
+    void        (*connection_close)(DBusConn*);
+    void        (*connection_unref)(DBusConn*);
+    void        (*connection_set_exit_on_disconnect)(DBusConn*, int);
+    const char* (*bus_get_unique_name)(DBusConn*);
+    void        (*bus_add_match)(DBusConn*, const char*, DBusErr*);
+    DBusMsg*    (*message_new_method_call)(const char*, const char*,
+                                           const char*, const char*);
+    void        (*message_unref)(DBusMsg*);
+    void        (*message_iter_init_append)(DBusMsg*, DBusIter*);
+    int         (*message_iter_append_basic)(DBusIter*, int, const void*);
+    int         (*message_iter_open_container)(DBusIter*, int, const char*, DBusIter*);
+    int         (*message_iter_close_container)(DBusIter*, DBusIter*);
+    DBusMsg*    (*connection_send_with_reply_and_block)(DBusConn*, DBusMsg*, int, DBusErr*);
+    int         (*connection_read_write_dispatch)(DBusConn*, int);
+    DBusMsg*    (*connection_pop_message)(DBusConn*);
+    int         (*message_is_signal)(DBusMsg*, const char*, const char*);
+    const char* (*message_get_path)(DBusMsg*);
+    int         (*message_iter_init)(DBusMsg*, DBusIter*);
+    int         (*message_iter_next)(DBusIter*);
+    int         (*message_iter_get_arg_type)(DBusIter*);
+    void        (*message_iter_get_basic)(DBusIter*, void*);
+    void        (*message_iter_recurse)(DBusIter*, DBusIter*);
+} db;
+
+static bool portal_load(void) {
+    if (db.tried) return db.lib != NULL;
+    db.tried = 1;
+    db.lib = dlopen("libdbus-1.so.3", RTLD_LAZY);
+    if (!db.lib) return false;
+    #define DBSYM(field, name) \
+        *(void**)(&db.field) = dlsym(db.lib, name); \
+        if (!db.field) { dlclose(db.lib); db.lib = NULL; return false; }
+    DBSYM(error_init,        "dbus_error_init")
+    DBSYM(error_is_set,      "dbus_error_is_set")
+    DBSYM(error_free,        "dbus_error_free")
+    DBSYM(bus_get_private,   "dbus_bus_get_private")
+    DBSYM(connection_close,  "dbus_connection_close")
+    DBSYM(connection_unref,  "dbus_connection_unref")
+    DBSYM(connection_set_exit_on_disconnect, "dbus_connection_set_exit_on_disconnect")
+    DBSYM(bus_get_unique_name, "dbus_bus_get_unique_name")
+    DBSYM(bus_add_match,     "dbus_bus_add_match")
+    DBSYM(message_new_method_call, "dbus_message_new_method_call")
+    DBSYM(message_unref,     "dbus_message_unref")
+    DBSYM(message_iter_init_append, "dbus_message_iter_init_append")
+    DBSYM(message_iter_append_basic, "dbus_message_iter_append_basic")
+    DBSYM(message_iter_open_container, "dbus_message_iter_open_container")
+    DBSYM(message_iter_close_container, "dbus_message_iter_close_container")
+    DBSYM(connection_send_with_reply_and_block, "dbus_connection_send_with_reply_and_block")
+    DBSYM(connection_read_write_dispatch, "dbus_connection_read_write_dispatch")
+    DBSYM(connection_pop_message, "dbus_connection_pop_message")
+    DBSYM(message_is_signal, "dbus_message_is_signal")
+    DBSYM(message_get_path,  "dbus_message_get_path")
+    DBSYM(message_iter_init, "dbus_message_iter_init")
+    DBSYM(message_iter_next, "dbus_message_iter_next")
+    DBSYM(message_iter_get_arg_type, "dbus_message_iter_get_arg_type")
+    DBSYM(message_iter_get_basic, "dbus_message_iter_get_basic")
+    DBSYM(message_iter_recurse, "dbus_message_iter_recurse")
+    #undef DBSYM
+    return true;
+}
+
+/* One {sv} pair into an already-open a{sv} array. */
+static void portal_opt(DBusIter* arr, const char* key, int type,
+                       const char* sig, const void* val) {
+    DBusIter ent, var;
+    db.message_iter_open_container(arr, DB_TYPE_DICT_ENTRY, NULL, &ent);
+    db.message_iter_append_basic(&ent, DB_TYPE_STRING, &key);
+    db.message_iter_open_container(&ent, DB_TYPE_VARIANT, sig, &var);
+    db.message_iter_append_basic(&var, type, val);
+    db.message_iter_close_container(&ent, &var);
+    db.message_iter_close_container(arr, &ent);
+}
+
+/* Dig "uri" out of the Response signal's a{sv} results. */
+static bool portal_find_uri(DBusIter* it, char* out, size_t sz) {
+    if (db.message_iter_get_arg_type(it) != DB_TYPE_ARRAY) return false;
+    DBusIter arr;
+    db.message_iter_recurse(it, &arr);
+    while (db.message_iter_get_arg_type(&arr) == DB_TYPE_DICT_ENTRY) {
+        DBusIter ent;
+        db.message_iter_recurse(&arr, &ent);
+        const char* key = NULL;
+        db.message_iter_get_basic(&ent, &key);
+        db.message_iter_next(&ent);
+        if (key && strcmp(key, "uri") == 0 &&
+            db.message_iter_get_arg_type(&ent) == DB_TYPE_VARIANT) {
+            DBusIter var;
+            db.message_iter_recurse(&ent, &var);
+            if (db.message_iter_get_arg_type(&var) == DB_TYPE_STRING) {
+                const char* uri = NULL;
+                db.message_iter_get_basic(&var, &uri);
+                if (uri) { snprintf(out, sz, "%s", uri); return true; }
+            }
+        }
+        db.message_iter_next(&arr);
+    }
+    return false;
+}
+
+/* percent-decode a file:// URI into a plain path */
+static void portal_uri_to_path(const char* uri, char* out, size_t sz) {
+    const char* p = uri;
+    if (!strncmp(p, "file://", 7)) p += 7;
+    size_t o = 0;
+    while (*p && o + 1 < sz) {
+        if (p[0] == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = { p[1], p[2], 0 };
+            out[o++] = (char)strtol(hex, NULL, 16);
+            p += 3;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = 0;
+}
+
+bool plat_portal_screenshot(char* out_path, size_t out_sz) {
+    if (!portal_load()) return false;
+
+    DBusErr err;
+    db.error_init(&err);
+    DBusConn* c = db.bus_get_private(DB_BUS_SESSION, &err);
+    if (!c) { db.error_free(&err); return false; }
+    db.connection_set_exit_on_disconnect(c, 0);
+
+    bool ok = false;
+    char token[64], expect[256], match[512];
+    /* The token only has to be unique within this connection. */
+    snprintf(token, sizeof token, "orb%u", (unsigned)(plat_now_ms() & 0xFFFFFFu));
+
+    const char* uniq = db.bus_get_unique_name(c);
+    if (uniq) {
+        /* Sender name -> path fragment: drop the ':' and turn '.' into '_'. */
+        char sender[128];
+        snprintf(sender, sizeof sender, "%s", uniq[0] == ':' ? uniq + 1 : uniq);
+        for (char* q = sender; *q; q++) if (*q == '.') *q = '_';
+        snprintf(expect, sizeof expect,
+                 "/org/freedesktop/portal/desktop/request/%s/%s", sender, token);
+
+        /* Listen BEFORE asking: a quick compositor can answer before the
+         * match rule would otherwise be in place. */
+        snprintf(match, sizeof match,
+                 "type='signal',interface='org.freedesktop.portal.Request',"
+                 "member='Response',path='%s'", expect);
+        db.bus_add_match(c, match, &err);
+
+        DBusMsg* m = db.message_new_method_call(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Screenshot",
+            "Screenshot");
+        if (m) {
+            DBusIter args, opts;
+            db.message_iter_init_append(m, &args);
+            const char* parent = "";
+            db.message_iter_append_basic(&args, DB_TYPE_STRING, &parent);
+            db.message_iter_open_container(&args, DB_TYPE_ARRAY, "{sv}", &opts);
+            const char* tok = token;
+            portal_opt(&opts, "handle_token", DB_TYPE_STRING, "s", &tok);
+            /* interactive=true: the compositor shows its own picker.
+             *
+             * The first version asked for interactive=false -- the whole
+             * screen, no UI, crop afterwards in our editor. GNOME refuses
+             * that, and is right to: a silent full-screen grab by a program
+             * the desktop cannot identify is the exact thing the portal
+             * exists to prevent. Ten attempts, ten refusals, and the journal
+             * saying so each time.
+             *
+             * Asking for the picker is not a workaround, it is the model. On
+             * Wayland the compositor owns the screen, so it owns the act of
+             * choosing what to photograph. It also hands back a REGION rather
+             * than a whole screen, which is what F4 wanted in the first
+             * place -- so on Wayland the compositor's selector stands in for
+             * ours, and the result lands in our editor exactly as before. */
+            int yes = 1;
+            portal_opt(&opts, "interactive", DB_TYPE_BOOLEAN, "b", &yes);
+            db.message_iter_close_container(&args, &opts);
+
+            DBusMsg* reply = db.connection_send_with_reply_and_block(c, m, 10000, &err);
+            db.message_unref(m);
+            if (reply) db.message_unref(reply);
+
+            if (!db.error_is_set(&err)) {
+                /* Wait for the Response. Long, because a permission prompt
+                 * may be sitting in front of the user. */
+                uint64_t deadline = plat_now_ms() + 120000;
+                while (plat_now_ms() < deadline && !ok) {
+                    if (!db.connection_read_write_dispatch(c, 200)) break;
+                    DBusMsg* sig;
+                    while ((sig = db.connection_pop_message(c)) != NULL) {
+                        if (db.message_is_signal(sig, "org.freedesktop.portal.Request",
+                                                 "Response")) {
+                            const char* path = db.message_get_path(sig);
+                            if (path && strcmp(path, expect) == 0) {
+                                DBusIter it;
+                                if (db.message_iter_init(sig, &it) &&
+                                    db.message_iter_get_arg_type(&it) == DB_TYPE_UINT32) {
+                                    unsigned code = 0;
+                                    db.message_iter_get_basic(&it, &code);
+                                    db.message_iter_next(&it);
+                                    char uri[1024];
+                                    /* code: 0 granted, 1 cancelled, 2 failed */
+                                    if (code == 0 && portal_find_uri(&it, uri, sizeof uri)) {
+                                        portal_uri_to_path(uri, out_path, out_sz);
+                                        ok = true;
+                                    } else {
+                                        fprintf(stderr, "[orb] portal screenshot "
+                                                "returned %u\n", code);
+                                        deadline = 0;   /* refused: stop waiting */
+                                    }
+                                }
+                            }
+                        }
+                        db.message_unref(sig);
+                    }
+                }
+            }
+        }
+    }
+    if (db.error_is_set(&err)) db.error_free(&err);
+    db.connection_close(c);
+    db.connection_unref(c);
+    return ok;
 }
 
 /* ---- image helpers ----------------------------------------------------

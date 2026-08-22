@@ -237,6 +237,17 @@ bool plat_open_in_editor(const char* path);
  * expected to work. */
 const char* plat_capture_unavailable(void);
 
+/* Take a screenshot the only way a Wayland compositor permits: ask the
+ * desktop portal to do it. Fills out_path with a PNG the caller owns and
+ * should delete when finished, and returns false where there is no portal,
+ * no D-Bus, or the user declined.
+ *
+ * Whole screen only -- the portal has no region variant -- which is why the
+ * result goes straight into the editor, where the crop tool already lives.
+ * Blocks for as long as the permission dialog is on screen, so call it from
+ * a background thread and never from the main loop. */
+bool plat_portal_screenshot(char* out_path, size_t out_sz);
+
 /* Rasterise a string with the SYSTEM font, into an 8-bit coverage mask.
  *
  * The built-in 5x7 glyphs are uppercase-only and read like a pocket
