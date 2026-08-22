@@ -57,6 +57,35 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.7 — the Linux right-click menu is a menu
+
+![The right-click menu on Ubuntu](media/linux_menu.png)
+
+The X11 "menu" was `popen("zenity --list ...")`. That is wrong three times
+over, and one report of *"the right-click menu isn't a real menu, and now
+Select region says not responding"* covers all three.
+
+It was a **dialog box**, not a menu, so it looked nothing like right-clicking
+anything else on the desktop. It **blocked the whole program** until answered
+— `popen` waits — so a region selector left open behind it stopped repainting
+and stopped taking input, which is exactly what "not responding" means, and no
+hotkey fired either. And it had **drifted**: no screenshot items, no camera, no
+delayed shot, none of the toggles added since it was written.
+
+It is now an override-redirect Xlib window with hit-tested rows: hover
+highlight, separators, keyboard navigation, click-away to dismiss, and every
+item the Windows menu has. Xlib rather than OpenGL because a menu is
+rectangles and text and X has drawn both since 1985; no GTK, no zenity, no new
+dependency. The loop calls the modal tick, so a recording in progress keeps
+taking frames while the menu is open — the same guarantee Windows got in 2.1.
+
+Also: the single-instance socket is now `SOCK_CLOEXEC`. Without it every child
+we spawn — `xdg-open`, the file manager, the image editor — inherits the lock,
+so one stray child outliving the orb would leave the next launch reporting
+"already running" with nothing running.
+
+---
+
 ## New in 3.6 — a first run lands in the right corner
 
 On a machine with no settings file the orb appeared at the top-left, hardcoded
@@ -437,10 +466,12 @@ the suite name the cause — a test that has never failed is decoration.
 > desktop — the result is black. Log out and choose an Xorg session, or use
 > Windows, until portal/PipeWire capture exists.
 >
-> *Still unexercised:* the tray, drag-and-drop onto the orb, the zenity
-> right-click menu, and the clipboard (`xclip`/`wl-copy`). Video and camera
-> remain Windows-only; Linux reports them unavailable rather than pretending.
-> Expect to fix things — but it works.
+> The right-click menu, capture, the editor and the hotkeys have all been
+> driven on that machine.
+>
+> *Still unexercised:* the tray, drag-and-drop onto the orb, and the clipboard
+> (`xclip`/`wl-copy`). Video and camera remain Windows-only; Linux reports them
+> unavailable rather than pretending. Expect to fix things — but it works.
 
 ```
 orb_recorder.c          core: orb, capture loop, editor, viewer

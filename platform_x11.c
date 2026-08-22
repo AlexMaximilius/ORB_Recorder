@@ -12,9 +12,8 @@
  *                    keystrokes stay in the queue for GLFW.
  * Monitor enum:      XRandR (Xrandr_CrtcInfo). Falls back to single monitor
  *                    at (0,0, root_w, root_h) if XRandR isn't available.
- * Right-click menu:  spawns `yad --notification`-style is heavy; we render a
- *                    simple owned popup (transient window with hit-tested rows).
- *                    Not fancy, but works with zero non-X deps.
+ * Right-click menu:  an override-redirect Xlib window with hit-tested rows,
+ *                    drawn with XDrawString. No GTK, no zenity, no blocking.
  * Folder paths:      $XDG_PICTURES_DIR (parsed from user-dirs.dirs) with
  *                    ~/Pictures fallback. Log at $XDG_STATE_HOME or
  *                    ~/.local/state/ORB_Recorder/log.txt.
@@ -55,6 +54,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -755,67 +755,248 @@ static char* which(const char* prog) {
     return buf[0] ? buf : NULL;
 }
 
+/* ---- right-click menu -------------------------------------------------
+ *
+ * A real popup, drawn here with Xlib.
+ *
+ * This used to shell out to `zenity --list` through popen(), which was wrong
+ * three times over. It is a dialog box rather than a menu, so it looks
+ * nothing like right-clicking anything else on the desktop. It blocks the
+ * caller until the user answers, so the whole program stopped -- a region
+ * selector left open behind it stopped repainting and stopped taking input,
+ * which reads as "not responding", and no hotkey worked either. And it had
+ * drifted: no screenshot items, no camera, no delayed shot, none of the
+ * toggles added since.
+ *
+ * Xlib rather than OpenGL because a menu is rectangles and text, X has drawn
+ * both since 1985, and it keeps the menu independent of whatever the GL
+ * context is doing. Override-redirect, because a menu is not an application
+ * window and no window manager should decorate, place or tab to it.
+ *
+ * The loop calls the modal tick, so a recording in progress keeps taking
+ * frames while the menu is open -- the same guarantee the Windows side got in
+ * 2.1, for the same reason.
+ */
+
+#define MENU_ROW_H   22
+#define MENU_PAD_X   14
+#define MENU_MAX     64
+
+typedef struct {
+    char label[72];
+    int  id;          /* PLAT_MENU_* , or 0 for a separator */
+    int  sep;
+} MenuRow;
+
+static PlatModalTickFn g_x11_modal_tick = NULL;
+void plat_set_modal_tick(PlatModalTickFn fn) { g_x11_modal_tick = fn; }
+
+static int menu_add(MenuRow* rows, int n, int id, const char* fmt, ...) {
+    if (n >= MENU_MAX) return n;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(rows[n].label, sizeof rows[n].label, fmt, ap);
+    va_end(ap);
+    rows[n].id = id;
+    rows[n].sep = 0;
+    return n + 1;
+}
+
+static int menu_sep(MenuRow* rows, int n) {
+    if (n >= MENU_MAX) return n;
+    rows[n].label[0] = 0;
+    rows[n].id = 0;
+    rows[n].sep = 1;
+    return n + 1;
+}
+
+static const char* onoff(bool b) { return b ? "[on] " : "[  ] "; }
+
 int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                    const PlatMonitor* monitors, int nmonitors) {
     (void)w;
-    char* zenity = which("zenity");
-    if (!zenity) {
-        fprintf(stderr, "[gif_orb] right-click menu unavailable: install `zenity`.\n");
-        return 0;
-    }
-    char cmd[4096];
-    int n = snprintf(cmd, sizeof cmd,
-        "zenity --list --title=\"ORB_Recorder\" --column=Action "
-        "\"GIF: record window\" \"GIF: record region\" "
-        "\"MP4: record window\" \"MP4: record region\" "
-        "\"F5 hotkey %s\" \"F6 hotkey %s\" \"F7 hotkey %s\" \"F8 hotkey %s\" "
-        "\"Sound source %s\" "
-        "\"Open folder after saving %s\" \"Copy file to clipboard %s\" "
-        "\"Double-click arms %s\" ",
-        st->hotkey_on[0] ? "[ON]" : "[OFF]",
-        st->hotkey_on[1] ? "[ON]" : "[OFF]",
-        st->hotkey_on[2] ? "[ON]" : "[OFF]",
-        st->hotkey_on[3] ? "[ON]" : "[OFF]",
-        st->audio_src == 0 ? "[OFF]" : st->audio_src == 1 ? "[SYSTEM]"
-                           : st->audio_src == 2 ? "[MIC]" : "[BOTH]",
-        st->auto_open ? "[ON]" : "[OFF]",
-        st->auto_clip ? "[ON]" : "[OFF]",
-        st->dbl_video ? "MP4" : "GIF");
-    for (int i = 0; i < nmonitors && n < (int)sizeof cmd - 128; i++)
-        n += snprintf(cmd + n, sizeof cmd - n, "\"Record %s\" ", monitors[i].name);
-    snprintf(cmd + n, sizeof cmd - n, "\"Help\" \"Edit settings file\" \"Quit\" 2>/dev/null");
+    Display* d = dpy();
+    if (!d) return 0;
 
-    FILE* f = popen(cmd, "r");
-    if (!f) return 0;
-    char pick[256] = {0};
-    if (!fgets(pick, sizeof pick, f)) { pclose(f); return 0; }
-    pclose(f);
-    for (char* c = pick; *c; c++) if (*c == '\n') { *c = 0; break; }
-
-    if (!strncmp(pick, "F5 hotkey", 9)) return PLAT_MENU_HOTKEY_BASE + 0;
-    if (!strncmp(pick, "F6 hotkey", 9)) return PLAT_MENU_HOTKEY_BASE + 1;
-    if (!strncmp(pick, "F7 hotkey", 9)) return PLAT_MENU_HOTKEY_BASE + 2;
-    if (!strncmp(pick, "F8 hotkey", 9)) return PLAT_MENU_HOTKEY_BASE + 3;
-    if (strstr(pick, "GIF: record window")) return PLAT_MENU_RECORD_GIF;
-    if (strstr(pick, "GIF: record region")) return PLAT_MENU_RECORD_REGION;
-    if (strstr(pick, "MP4: record window")) return PLAT_MENU_RECORD_VIDEO;
-    if (strstr(pick, "MP4: record region")) return PLAT_MENU_RECORD_VIDEO_RGN;
-    if (strstr(pick, "Sound source"))       return PLAT_MENU_AUDIO_BASE
-                                                 + ((st->audio_src + 1) & 3);
-    if (strstr(pick, "Open folder"))        return PLAT_MENU_TOGGLE_AUTOOPEN;
-    if (strstr(pick, "Copy file"))          return PLAT_MENU_TOGGLE_CLIP;
-    if (strstr(pick, "Double-click arms"))  return st->dbl_video
-                                                 ? PLAT_MENU_DBL_GIF
-                                                 : PLAT_MENU_DBL_MP4;
-    if (strstr(pick, "Help"))               return PLAT_MENU_HELP;
-    if (strstr(pick, "Edit settings"))      return PLAT_MENU_EDIT_SETTINGS;
-    if (!strcmp(pick, "Quit"))              return PLAT_MENU_QUIT;
-    for (int i = 0; i < nmonitors; i++) {
-        char want[96];
-        snprintf(want, sizeof want, "Record %s", monitors[i].name);
-        if (!strcmp(pick, want)) return PLAT_MENU_MONITOR_BASE + i;
+    /* ---- rows: the same menu the Windows build offers ---- */
+    MenuRow rows[MENU_MAX];
+    int n = 0;
+    n = menu_add(rows, n, PLAT_MENU_SHOT_REGION,     "Screenshot: region            F4");
+    n = menu_add(rows, n, PLAT_MENU_SHOT_WINDOW,     "Screenshot: window");
+    n = menu_add(rows, n, PLAT_MENU_SHOT_DELAY_5,    "Screenshot: delayed 5s (captures menus)");
+    n = menu_sep(rows, n);
+    n = menu_add(rows, n, PLAT_MENU_RECORD_GIF,      "GIF: record window            F5");
+    n = menu_add(rows, n, PLAT_MENU_RECORD_REGION,   "GIF: record region            F6");
+    n = menu_add(rows, n, PLAT_MENU_RECORD_VIDEO,    "MP4: record window            F7");
+    n = menu_add(rows, n, PLAT_MENU_RECORD_VIDEO_RGN,"MP4: record region            F8");
+    for (int i = 0; i < nmonitors && i < 4; i++)
+        n = menu_add(rows, n, PLAT_MENU_MONITOR_BASE + i, "GIF: record %s", monitors[i].name);
+    for (int i = 0; i < nmonitors && i < 4; i++)
+        n = menu_add(rows, n, PLAT_MENU_VMONITOR_BASE + i, "MP4: record %s", monitors[i].name);
+    n = menu_sep(rows, n);
+    {
+        static const char* SRC[4] = { "off", "system", "microphone", "system + mic" };
+        n = menu_add(rows, n, PLAT_MENU_AUDIO_BASE + ((st->audio_src + 1) & 3),
+                     "Sound source: %s  (click to change)", SRC[st->audio_src & 3]);
+        n = menu_add(rows, n, st->dbl_video ? PLAT_MENU_DBL_GIF : PLAT_MENU_DBL_MP4,
+                     "Double-click arms: %s  (click to change)",
+                     st->dbl_video ? "MP4" : "GIF");
     }
-    return 0;
+    n = menu_sep(rows, n);
+    {
+        static const char* HKN[PLAT_HK_COUNT] = { "F5","F6","F7","F8","F9","F4","PrtSc" };
+        for (int i = 0; i < PLAT_HK_COUNT; i++)
+            n = menu_add(rows, n, PLAT_MENU_HOTKEY_BASE + i,
+                         "%sHotkey %s", onoff(st->hotkey_on[i]), HKN[i]);
+    }
+    n = menu_sep(rows, n);
+    n = menu_add(rows, n, PLAT_MENU_TOGGLE_AUTOOPEN, "%sOpen folder after saving", onoff(st->auto_open));
+    n = menu_add(rows, n, PLAT_MENU_TOGGLE_CLIP,     "%sCopy file to clipboard", onoff(st->auto_clip));
+    {
+        static const char* SE[3] = { "nothing", "the built-in editor", "the system editor" };
+        n = menu_add(rows, n, PLAT_MENU_SHOT_ED_BASE + ((st->shot_editor + 1) % 3),
+                     "After a screenshot: open %s  (click to change)",
+                     SE[st->shot_editor % 3]);
+    }
+    n = menu_sep(rows, n);
+    n = menu_add(rows, n, PLAT_MENU_OPEN_EDITOR,   "Open image or GIF...");
+    n = menu_add(rows, n, PLAT_MENU_HELP,          "Help                          F1");
+    n = menu_add(rows, n, PLAT_MENU_EDIT_SETTINGS, "Edit settings file...");
+    n = menu_sep(rows, n);
+    n = menu_add(rows, n, PLAT_MENU_QUIT,          "Quit");
+
+    /* ---- font ---- */
+    XFontStruct* fnt = XLoadQueryFont(d, "-*-dejavu sans mono-medium-r-*--13-*");
+    if (!fnt) fnt = XLoadQueryFont(d, "9x15");
+    if (!fnt) fnt = XLoadQueryFont(d, "fixed");
+    if (!fnt) return 0;                      /* no core fonts: give up quietly */
+
+    int wpx = 0;
+    for (int i = 0; i < n; i++) {
+        int lw = XTextWidth(fnt, rows[i].label, (int)strlen(rows[i].label));
+        if (lw > wpx) wpx = lw;
+    }
+    wpx += MENU_PAD_X * 2;
+    int hpx = 6;
+    for (int i = 0; i < n; i++) hpx += rows[i].sep ? (MENU_ROW_H / 2) : MENU_ROW_H;
+    hpx += 6;
+
+    /* ---- place it at the pointer, kept on screen ---- */
+    int px = 0, py = 0;
+    plat_get_cursor(&px, &py);
+    int scr = DefaultScreen(d);
+    int sw = DisplayWidth(d, scr), sh = DisplayHeight(d, scr);
+    if (px + wpx > sw) px = sw - wpx;
+    if (py + hpx > sh) py = sh - hpx;
+    if (px < 0) px = 0;
+    if (py < 0) py = 0;
+
+    XSetWindowAttributes wa;
+    wa.override_redirect = True;
+    wa.background_pixel  = 0x1E1E22;
+    wa.border_pixel      = 0x505058;
+    wa.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask |
+                    PointerMotionMask | KeyPressMask | LeaveWindowMask;
+    Window mw = XCreateWindow(d, DefaultRootWindow(d), px, py, (unsigned)wpx,
+                              (unsigned)hpx, 1, CopyFromParent, InputOutput,
+                              CopyFromParent,
+                              CWOverrideRedirect | CWBackPixel | CWBorderPixel |
+                              CWEventMask, &wa);
+    XMapRaised(d, mw);
+
+    GC gc = XCreateGC(d, mw, 0, NULL);
+    XSetFont(d, gc, fnt->fid);
+
+    /* Grab the pointer so a click anywhere dismisses, the way a menu should.
+     * Not fatal if the grab is refused -- the menu still works, it just will
+     * not see clicks that land on other windows. */
+    XGrabPointer(d, mw, True,
+                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                 GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+    XGrabKeyboard(d, mw, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+
+    int hover = -1, chosen = 0, running = 1;
+
+    while (running) {
+        /* Keep the application alive: a recording in progress must not stop
+         * because a menu is open. */
+        if (g_x11_modal_tick) g_x11_modal_tick();
+
+        while (XPending(d)) {
+            XEvent ev;
+            XNextEvent(d, &ev);
+            if (ev.xany.window != mw) continue;
+            if (ev.type == Expose) { hover = hover; }
+            else if (ev.type == MotionNotify) {
+                int y = 6, h2 = -1;
+                for (int i = 0; i < n; i++) {
+                    int rh = rows[i].sep ? (MENU_ROW_H / 2) : MENU_ROW_H;
+                    if (ev.xmotion.y >= y && ev.xmotion.y < y + rh && !rows[i].sep)
+                        h2 = i;
+                    y += rh;
+                }
+                hover = h2;
+            } else if (ev.type == ButtonPress) {
+                if (ev.xbutton.x < 0 || ev.xbutton.y < 0 ||
+                    ev.xbutton.x >= wpx || ev.xbutton.y >= hpx) {
+                    running = 0;               /* clicked away */
+                } else if (hover >= 0) {
+                    chosen = rows[hover].id;
+                    running = 0;
+                }
+            } else if (ev.type == KeyPress) {
+                KeySym ks = XLookupKeysym(&ev.xkey, 0);
+                if (ks == XK_Escape) running = 0;
+                else if (ks == XK_Down || ks == XK_Up) {
+                    int dir = (ks == XK_Down) ? 1 : -1;
+                    int i = hover;
+                    for (int step = 0; step < n; step++) {
+                        i += dir;
+                        if (i < 0) i = n - 1;
+                        if (i >= n) i = 0;
+                        if (!rows[i].sep) break;
+                    }
+                    hover = i;
+                } else if (ks == XK_Return || ks == XK_KP_Enter) {
+                    if (hover >= 0) chosen = rows[hover].id;
+                    running = 0;
+                }
+            }
+        }
+
+        /* ---- paint ---- */
+        XSetForeground(d, gc, 0x1E1E22);
+        XFillRectangle(d, mw, gc, 0, 0, (unsigned)wpx, (unsigned)hpx);
+        int y = 6;
+        for (int i = 0; i < n; i++) {
+            int rh = rows[i].sep ? (MENU_ROW_H / 2) : MENU_ROW_H;
+            if (rows[i].sep) {
+                XSetForeground(d, gc, 0x3A3A42);
+                XDrawLine(d, mw, gc, 8, y + rh / 2, wpx - 8, y + rh / 2);
+            } else {
+                if (i == hover) {
+                    XSetForeground(d, gc, 0xF08A1E);
+                    XFillRectangle(d, mw, gc, 2, y, (unsigned)(wpx - 4), (unsigned)rh);
+                    XSetForeground(d, gc, 0x1A1A1E);
+                } else {
+                    XSetForeground(d, gc, 0xE0E0E8);
+                }
+                XDrawString(d, mw, gc, MENU_PAD_X, y + MENU_ROW_H - 7,
+                            rows[i].label, (int)strlen(rows[i].label));
+            }
+            y += rh;
+        }
+        XFlush(d);
+        plat_sleep_ms(16);
+    }
+
+    XUngrabKeyboard(d, CurrentTime);
+    XUngrabPointer(d, CurrentTime);
+    XFreeGC(d, gc);
+    XDestroyWindow(d, mw);
+    XFreeFont(d, fnt);
+    XFlush(d);
+    return chosen;
 }
 
 /* ---- image helpers ----------------------------------------------------
@@ -1087,7 +1268,11 @@ void plat_draw_orb_2d(struct GLFWwindow* w, int win_size, int orb_size,
 bool plat_single_instance(void) {
     static int held = -1;
     if (held >= 0) return true;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* CLOEXEC, or every child inherits the lock. This program spawns
+     * xdg-open, a file manager and an image editor, and without it a stray
+     * child outliving the orb would keep the name bound -- leaving the next
+     * launch to report "already running" with nothing running. */
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return true;                /* cannot tell -- do not block */
     struct sockaddr_un a;
     memset(&a, 0, sizeof a);
@@ -1326,11 +1511,6 @@ static void* pthread_trampoline(void* p) {
     free(j);
     return NULL;
 }
-/* The X11 menu is drawn and driven by our own code rather than by a
- * platform modal loop, so nothing blocks the caller and there is nothing
- * to keep alive. Accept the registration and ignore it. */
-void plat_set_modal_tick(PlatModalTickFn fn) { (void)fn; }
-
 void plat_run_background(PlatJobFn fn, void* arg) {
     PxJob* j = (PxJob*)malloc(sizeof *j);
     j->fn = fn; j->arg = arg;
