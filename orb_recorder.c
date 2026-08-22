@@ -1088,7 +1088,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.5",
+    "ORB_RECORDER  v3.6",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -4463,12 +4463,29 @@ int main(int argc, char** argv) {
         log_write("boot", "restored orb position (%d,%d), anchor derived",
                   g.orb_x, g.orb_y);
     } else {
-        g.orb_x = g.want_orb_x = 50;
-        g.orb_y = g.want_orb_y = 50;
+        /* First run: park it bottom-right -- the same corner the recovery
+         * path below already picks. This was a hardcoded (50,50), the
+         * top-left, which is where titlebars, menus and half the world's
+         * window buttons live, so a new user's first sight of the orb was of
+         * it sitting on top of something. Nobody here noticed, because every
+         * machine we own has a settings file older than the question. */
+        PlatMonitor mons[GIF_MAX_MONITORS];
+        int n = plat_enum_monitors(mons, GIF_MAX_MONITORS);
+        if (n > 0) {
+            int pi = primary_monitor_index(mons, n);
+            g.orb_x = mons[pi].x + mons[pi].w - g.orb_size * 2;
+            g.orb_y = mons[pi].y + mons[pi].h - g.orb_size * 3;
+        } else {
+            g.orb_x = 50; g.orb_y = 50;
+        }
+        g.want_orb_x = g.orb_x;
+        g.want_orb_y = g.orb_y;
         g.have_orb_pos = true;
         g.orb_displaced = false;
         orb_move_to(g.orb_x, g.orb_y);
         anchor_from_position(g.orb_x, g.orb_y, ORB_SIZE, ORB_SIZE);
+        log_write("boot", "first run: parked the orb at (%d,%d) on %d monitor(s)",
+                  g.orb_x, g.orb_y, n);
     }
     plat_window_setup(g.window);
     /* setup() forces the window to 50,50 -- put it back. orb_move_to(), NOT

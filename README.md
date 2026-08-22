@@ -57,6 +57,20 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.6 — a first run lands in the right corner
+
+On a machine with no settings file the orb appeared at the top-left, hardcoded
+to (50,50) — where titlebars, menus and half the world's window buttons live,
+so the very first thing a new user saw was the orb sitting on top of
+something. The recovery path twenty lines further down had always chosen
+bottom-right; first run now uses the same calculation.
+
+It survived this long because every machine here has a settings file older
+than the question. It took a laptop that had never run the program before to
+show the default anybody else would get.
+
+---
+
 ## New in 3.5 — Wayland tells the truth
 
 3.4 was tested under Xvfb, which has no window manager and is real X11. A
