@@ -30,7 +30,7 @@ corner of the same monitor even if that monitor was asleep at boot.
 
 | key | does |
 |---|---|
-| **F4** / **PrintScreen** | drag a rectangle → **PNG**, on the clipboard, opens in Paint |
+| **F4** / **PrintScreen** | drag a rectangle → **PNG**, on the clipboard, opens in the editor |
 | **F5** | record the focused window → GIF |
 | **F6** | drag a region → GIF |
 | **F7** | record the focused window → MP4 with sound |
@@ -49,11 +49,59 @@ capture, a **delayed screenshot** that can photograph an open menu, sound
 source, *Run at startup*, and a checkbox per hotkey so you can hand F5 back to
 whatever else wants it.
 
-**Drop a file on the orb.** GIFs open a frame editor with trim. Images open a
-viewer. Videos open in your default player.
+**Drop a file on the orb.** GIFs open a frame editor with trim. Images open
+the annotation editor. Videos open in your default player.
 
 Colour is state: orange idle, yellow armed, **red recording GIF**, **magenta
 recording video**, **cyan recording camera**, green editing.
+
+---
+
+## New in 3.1 — the editor is ours now
+
+![The built-in screenshot editor](media/editor.png)
+
+3.0 handed screenshots to Paint. This one has its own editor, because Paint is
+being retired and because a screenshot editor is about four hundred lines when
+you already own a window, a texture and a PNG writer.
+
+Take a shot and it opens here: **arrow, box, oval, line, freehand, marker,
+pixelate, text, numbered steps, crop**. Eight colours, a thickness, undo and
+redo, `Ctrl+C` for the clipboard and `Ctrl+S` to save over the file. Every
+tool is one key — the row along the bottom of the window lists them so there
+is nothing to memorise. It works on any image you drop on the orb, not only on
+screenshots.
+
+Three things about it are deliberate:
+
+**A stroke is rasterised the moment you let go.** Greenshot keeps each
+annotation as a live object you can move afterwards, which is genuinely nicer
+and costs a selection model, hit-testing, drag handles, z-order and a document
+format. Undo covers the same ground for a fraction of the code, and one pixel
+buffer is the whole document.
+
+**The preview is the result.** The shape you see while dragging is drawn by
+the same `paint.h` call that commits it, into the same buffer. An editor that
+previews on the GPU and saves on the CPU has two rasterisers and eventually
+two answers; this one cannot disagree with itself. It repaints only the dirty
+rectangle, so a drag stays smooth on a 4K screenshot instead of pushing 30 MB
+per mouse-move.
+
+**The marker multiplies and the obfuscator averages.** A highlighter that
+covers the text it marks is a redaction, so `MRK` keeps the darker of the two
+channels and the words stay readable through the colour. Obfuscation is a
+block average rather than a blur, because blurs have been reversed on
+published screenshots more than once and an average has nothing left to
+reverse.
+
+Text uses the **system font** via a coverage mask from GDI, so labels are real
+mixed-case type rather than the built-in 5×7 glyphs. Where no font engine is
+available — X11, today — it falls back to those glyphs rather than dropping
+the text.
+
+Paint is still one click away: *After a screenshot, open >* in the right-click
+menu picks between the built-in editor, the system image editor, and nothing
+at all.
 
 ---
 
@@ -63,8 +111,9 @@ recording video**, **cyan recording camera**, green editing.
 almost never finished at the moment it is taken — something in it wants
 circling, cropping, or blanking out — so the shot now arrives in an image
 editor with the folder behind it, on top of already being on the clipboard.
-Region, window and delayed captures all behave the same way. Uncheck *Open
-screenshots in Paint* in the right-click menu if you'd rather it didn't.
+Region, window and delayed captures all behave the same way. (3.1 replaced
+Paint with the built-in editor and turned the checkbox into the three-way
+*After a screenshot, open >* above.)
 
 Not hardcoded to Paint: it asks the shell for the **`edit` verb**, which is a
 different thing from `open`. Double-clicking a `.png` gets you a viewer;
@@ -185,6 +234,7 @@ platform.h              the OS seam, ~30 functions
 platform_win32.c        Windows: GDI, hotkeys, shell, COM, WIC, registry
 platform_win32_video.c  Windows: H.264/AAC via Media Foundation + WASAPI
 platform_x11.c          Linux: XShm, XGrabKey, XDG, gdk-pixbuf
+paint.h                 annotation rasteriser: lines, shapes, blur, masks
 gif.h                   GIF89a writer
 gif_reader.h            GIF89a reader
 png_write.h             PNG writer
@@ -230,7 +280,8 @@ dialog box.
 
 **Written by Alex Maximilius ("Alex Maz"). Published 2026-08-15 and
 dedicated to the public domain by its copyright holder.** Items 13–16 were
-added 2026-08-21 and are published as of that date.
+added 2026-08-21 and items 17–20 on 2026-08-22; each is published as of the
+date given.
 
 This section exists so the design described here **cannot be patented by
 anyone**, including me. Publication with a date establishes prior art: what is
@@ -295,6 +346,23 @@ automatically.
     and as part of the capture, so that the capture arrives in something that
     can annotate it; including doing so alongside placing the same capture on
     the clipboard and revealing it in its containing folder.
+17. Presenting a capture in an annotation editor in which the live preview of
+    a shape being dragged is produced by the same rasteriser, into the same
+    pixel buffer, that will commit it -- so that the preview and the saved
+    file cannot differ -- with the preview confined to the changed rectangle
+    so that the cost is independent of the image's size.
+18. Annotating by immediate rasterisation into a single pixel buffer, with a
+    bounded stack of whole-image snapshots as the undo model, in place of a
+    retained-object document; including treating a crop, which changes the
+    image's dimensions, as an ordinary entry on that same stack.
+19. Marking up a capture with a multiplicative highlight that preserves the
+    legibility of what is beneath it, and obfuscating with a block average
+    chosen over a blur specifically because averaging is not invertible.
+20. Rendering annotation text by obtaining a coverage mask from the host
+    operating system's font engine and compositing it into the image, so that
+    an application with no font library of its own still produces text in the
+    system's typeface, falling back to a built-in bitmap font where no such
+    engine is present.
 
 **Also disclosed, as obvious extensions:** any other shape in place of a
 circle; any other colour scheme or use of motion, size, opacity or sound to

@@ -161,7 +161,7 @@ enum {
     PLAT_MENU_SHOT_DELAY_5    = 148,   /* the monitor under the cursor, after 5s */
     PLAT_MENU_RUN_AT_STARTUP  = 145,   /* launch when the user logs in     */
     PLAT_MENU_HIDE_ORB        = 146,   /* hide the orb; tray is the way back */
-    PLAT_MENU_TOGGLE_PAINT    = 150,   /* open screenshots in an image editor */
+    PLAT_MENU_SHOT_ED_BASE    = 150,   /* +0 nothing +1 built-in +2 system */
     PLAT_MENU_MONITOR_BASE    = 200,   /* GIF:   + monitor index */
     PLAT_MENU_VMONITOR_BASE   = 300,   /* VIDEO: + monitor index */
     PLAT_MENU_CAMERA_BASE     = 400    /* CAMERA: + device index */
@@ -174,7 +174,7 @@ typedef struct {
     bool hotkey_on[PLAT_HK_COUNT];   /* 0=F5 1=F6 2=F7 3=F8 4=F9 5=F4 6=PrtSc */
     bool auto_open;
     bool auto_clip;
-    bool edit_shots;     /* hand a new screenshot to the image editor */
+    int  shot_editor;    /* 0 = nothing, 1 = the built-in one, 2 = the OS one */
     bool tray_only;
     int  audio_src;
     bool dbl_video;      /* double-click arms MP4 rather than GIF */
@@ -222,6 +222,19 @@ void plat_open_folder_select(const char* file_path);
  *
  * Returns false if nothing could be launched. */
 bool plat_open_in_editor(const char* path);
+
+/* Rasterise a string with the SYSTEM font, into an 8-bit coverage mask.
+ *
+ * The built-in 5x7 glyphs are uppercase-only and read like a pocket
+ * calculator. That is the right look for a toolbar and the wrong one for a
+ * label somebody is about to put on a screenshot and send to a colleague,
+ * which wants mixed case, real spacing and hinting -- all of which the OS
+ * already has and none of which is worth reimplementing.
+ *
+ * Returns a malloc'd mask of *out_w * *out_h bytes (0 = nothing, 255 =
+ * solid) for the caller to free, or NULL where there is no font engine, in
+ * which case the caller falls back to the built-in glyphs. */
+uint8_t* plat_render_text(const char* s, int px_height, int* out_w, int* out_h);
 
 /* ---- copy a file path onto the clipboard as a file drop (CF_HDROP) ----
  * After this, Ctrl-V in Slack / Discord / GitHub / Explorer attaches the file. */

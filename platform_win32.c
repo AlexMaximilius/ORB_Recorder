@@ -864,8 +864,19 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                 PLAT_MENU_TOGGLE_AUTOOPEN, "Open folder after saving");
     AppendMenuA(root, MF_STRING | (st->auto_clip ? MF_CHECKED : MF_UNCHECKED),
                 PLAT_MENU_TOGGLE_CLIP,     "Copy file to clipboard");
-    AppendMenuA(root, MF_STRING | (st->edit_shots ? MF_CHECKED : MF_UNCHECKED),
-                PLAT_MENU_TOGGLE_PAINT,    "Open screenshots in Paint");
+    {
+        /* Radio rather than a checkbox: "edit it here", "edit it in Paint"
+         * and "just save it" are three answers to one question, and a pair of
+         * checkboxes that cannot both be ticked is a worse way to say that. */
+        HMENU se = CreatePopupMenu();
+        static const char* SEN[3] = { "Nothing -- just save it",
+                                      "The built-in editor",
+                                      "The system image editor (Paint)" };
+        for (int i = 0; i < 3; i++)
+            AppendMenuA(se, MF_STRING | (st->shot_editor == i ? MF_CHECKED : 0),
+                        PLAT_MENU_SHOT_ED_BASE + (UINT)i, SEN[i]);
+        AppendMenuA(root, MF_POPUP, (UINT_PTR)se, "After a screenshot, open >");
+    }
     AppendMenuA(root, MF_STRING | (st->tray_only ? MF_CHECKED : MF_UNCHECKED),
                 PLAT_MENU_TOGGLE_TRAY,     "Tray icon only");
     AppendMenuA(root, MF_STRING, PLAT_MENU_HIDE_ORB,
@@ -1227,6 +1238,69 @@ void plat_open_with_default_app(const char* path) {
  * Also ShellExecute needs COM initialized on the calling thread; when we
  * hop in here from a background thread the thread trampoline handles it.
  */
+uint8_t* plat_render_text(const char* s, int px_height, int* out_w, int* out_h) {
+    if (!s || !*s || px_height < 4) return NULL;
+    if (px_height > 512) px_height = 512;
+
+    /* Segoe UI is the Windows UI face and is present on everything since
+     * Vista; the fallback chain in CreateFont handles the day it is not. */
+    HFONT font = CreateFontA(-px_height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS,
+                             "Segoe UI");
+    if (!font) return NULL;
+
+    HDC screen = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(screen);
+    ReleaseDC(NULL, screen);
+    if (!dc) { DeleteObject(font); return NULL; }
+    HGDIOBJ oldf = SelectObject(dc, font);
+
+    SIZE sz;
+    if (!GetTextExtentPoint32A(dc, s, (int)strlen(s), &sz) || sz.cx <= 0) {
+        SelectObject(dc, oldf); DeleteDC(dc); DeleteObject(font); return NULL;
+    }
+    int w = sz.cx + 4, h = sz.cy + 2;      /* room for the antialiased edge */
+
+    /* White on black, then read the green channel as coverage. Rendering to a
+     * mask this way rather than asking for a glyph bitmap keeps kerning,
+     * ligatures and the font's own hinting, because GDI lays out the whole
+     * string exactly as it would on screen. */
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof bmi);
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;           /* top-down */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP dib = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!dib) {
+        SelectObject(dc, oldf); DeleteDC(dc); DeleteObject(font); return NULL;
+    }
+    HGDIOBJ oldb = SelectObject(dc, dib);
+    RECT all = { 0, 0, w, h };
+    FillRect(dc, &all, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    TextOutA(dc, 2, 1, s, (int)strlen(s));
+    GdiFlush();
+
+    uint8_t* mask = (uint8_t*)malloc((size_t)w * h);
+    if (mask) {
+        const uint8_t* src = (const uint8_t*)bits;
+        for (int i = 0; i < w * h; i++) mask[i] = src[i * 4 + 1];
+        *out_w = w; *out_h = h;
+    }
+    SelectObject(dc, oldb);
+    DeleteObject(dib);
+    SelectObject(dc, oldf);
+    DeleteDC(dc);
+    DeleteObject(font);
+    return mask;
+}
+
 bool plat_open_in_editor(const char* path) {
     char norm[MAX_PATH];
     size_t n = strlen(path);

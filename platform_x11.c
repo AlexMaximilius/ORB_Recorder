@@ -1150,6 +1150,15 @@ void plat_clipboard_copy_file(const char* file_path) {
     fprintf(stderr, "[gif_orb] clipboard copy unavailable: install xclip or wl-copy.\n");
 }
 
+/* No font engine is linked here on purpose: pulling in Xft/fontconfig for
+ * one string would be the first real dependency in the whole program. NULL
+ * tells the caller to use the built-in glyphs, which is honest and visible
+ * rather than silently dropping the text. */
+uint8_t* plat_render_text(const char* s, int px_height, int* out_w, int* out_h) {
+    (void)s; (void)px_height; (void)out_w; (void)out_h;
+    return NULL;
+}
+
 bool plat_open_in_editor(const char* path) {
     /* There is no "edit" verb in the freedesktop world -- xdg-open hands a
      * PNG to the default handler, which is a viewer. So ask for an editor by

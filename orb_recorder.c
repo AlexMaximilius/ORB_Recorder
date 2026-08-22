@@ -53,6 +53,7 @@
 #include "platform.h"
 #define PNG_WRITE_IMPLEMENTATION
 #include "png_write.h"
+#include "paint.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -148,8 +149,15 @@ typedef struct {
     bool auto_clipboard;
     /* A screenshot is almost never finished at the moment it is taken --
      * something in it wants circling, cropping or blanking out. Handing it
-     * straight to an editor removes the step everybody does by hand. */
-    bool edit_shots;
+     * straight to an editor removes the step everybody does by hand.
+     * 0 = nothing, 1 = the built-in editor, 2 = whatever the OS uses. */
+    int  shot_editor;
+
+    /* Set by save_screenshot, acted on by the main loop. The delayed capture
+     * saves from a background thread, and creating a window off the main
+     * thread is undefined behaviour in GLFW on every platform -- so the path
+     * is parked here and opened where windows are allowed to be made. */
+    char pending_edit[600];
     bool tray_only;               /* hide taskbar button, use notification area */
     int  audio_src;               /* PLAT_AUDIO_* for video recording */
     bool dbl_video;               /* double-click arms MP4 rather than GIF */
@@ -379,7 +387,7 @@ static void settings_save(void) {
         fprintf(f, "hk_%s=%d\n", HK_NAMES[i], g.hotkey_on[i] ? 1 : 0);
     fprintf(f, "auto_open=%d\n", g.auto_open_folder ? 1 : 0);
     fprintf(f, "auto_clip=%d\n", g.auto_clipboard ? 1 : 0);
-    fprintf(f, "edit_shots=%d\n", g.edit_shots ? 1 : 0);
+    fprintf(f, "shot_editor=%d\n", g.shot_editor);
     fprintf(f, "tray_only=%d\n", g.tray_only ? 1 : 0);
     fprintf(f, "orb_hidden=%d\n", g_orb_hidden ? 1 : 0);
     fprintf(f, "audio_src=%d\n", g.audio_src);
@@ -448,7 +456,13 @@ static void settings_load(void) {
         else if (!strcmp(key, "orb_fx"))    { g.anchor_fx = val; g.have_anchor = true; }
         else if (!strcmp(key, "orb_fy"))    { g.anchor_fy = val; }
         else if (!strcmp(key, "auto_clip")) { g.auto_clipboard = val != 0; }
-        else if (!strcmp(key, "edit_shots")) { g.edit_shots = val != 0; }
+        else if (!strcmp(key, "shot_editor")) {
+            g.shot_editor = (val < 0 || val > 2) ? 1 : val;
+        }
+        /* 2.x wrote a plain on/off flag; on meant the system editor, which
+         * was the only one there was. Keep those settings meaning what they
+         * meant rather than silently changing what the tool does. */
+        else if (!strcmp(key, "edit_shots")) { g.shot_editor = val ? 2 : 0; }
         else if (!strcmp(key, "tray_only")) { g.tray_only = val != 0; }
         else if (!strcmp(key, "orb_hidden")) { g_orb_hidden = val != 0; }
         else if (!strcmp(key, "dbl_video")) { g.dbl_video = val != 0; }
@@ -1043,7 +1057,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.0",
+    "ORB_RECORDER  v3.1",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1053,7 +1067,16 @@ static const char* HELP_LINES[] = {
     "  F4 / PRTSC      SCREENSHOT A REGION -> PNG",
     "  HIDE ORB        RIGHT-CLICK MENU; TRAY ICON BRINGS IT BACK",
     "  DELAYED SHOT    RIGHT-CLICK MENU; THE ONLY WAY TO CAPTURE A MENU",
-    "  EVERY SHOT      OPENS IN PAINT + THE FOLDER (RIGHT-CLICK TO STOP)",
+    "  EVERY SHOT      OPENS IN THE EDITOR + THE FOLDER",
+    "",
+    "EDITOR (ANY SCREENSHOT OR IMAGE)",
+    "  A ARROW   R BOX    E OVAL   L LINE   P PEN",
+    "  H MARKER  X PIXELATE  T TEXT  N NUMBER  C CROP",
+    "  [ ]             THINNER / THICKER",
+    "  1-8             COLOUR",
+    "  CTRL+Z / CTRL+Y UNDO / REDO",
+    "  CTRL+C          COPY THE EDITED IMAGE",
+    "  CTRL+S          SAVE OVER THE FILE",
     "  F5              RECORD THE FOCUSED WINDOW / STOP",
     "  F6              DRAG A REGION, RECORD IT / STOP",
     "  F7              RECORD VIDEO + SOUND, WINDOW / STOP",
@@ -1698,6 +1721,9 @@ static void on_drop(GLFWwindow* w, int count, const char* paths[]);
 static void on_ed_move(GLFWwindow* w, int x, int y);
 static void on_ed_size(GLFWwindow* w, int cw, int ch);
 static void on_ed_mouse(GLFWwindow* w, int button, int action, int mods);
+static void on_ed_cursor(GLFWwindow* w, double mx, double my);
+static void on_ed_char(GLFWwindow* w, unsigned int cp);
+static void an_reset(void);
 static void ed_draw_arrows(int w, int h);
 
 #define ED_MAX_FILES 512
@@ -1800,6 +1826,7 @@ static void ed_close(void) {
     }
     GifReaderClose(&g.ed_r);
     ed_free_playlist();
+    an_reset();
     g.ed_open = false;
     g.ed_playing = false;
     g.ed_main_tex_frame = -1;
@@ -1897,6 +1924,7 @@ static void ed_goto_file(int idx) {
     g.ed_file_idx = idx;
     strncpy(g.ed_path, next, sizeof g.ed_path - 1);
     g.ed_path[sizeof g.ed_path - 1] = 0;
+    an_reset();
 
     g.ed_frame = 0;
     g.ed_trim_in = 0;
@@ -1917,7 +1945,7 @@ static void ed_goto_file(int idx) {
     if (b2 > base) base = b2;
     char title[600];
     snprintf(title, sizeof title, "%s - %s",
-             g.ed_is_static ? "Image Viewer" : "GIF Editor",
+             g.ed_is_static ? "Image Editor" : "GIF Editor",
              base ? base + 1 : next);
     glfwSetWindowTitle(g.ed_window, title);
     glfwMakeContextCurrent(g.window);
@@ -2073,7 +2101,7 @@ static bool ed_open_path(const char* path) {
     const char* base2 = strrchr(path, '/');
     if (base2 > base) base = base2;
     snprintf(title, sizeof title, "%s - %s",
-             g.ed_is_static ? "Image Viewer" : "GIF Editor",
+             g.ed_is_static ? "Image Editor" : "GIF Editor",
              base ? base + 1 : path);
 
     g.ed_window = glfwCreateWindow(win_w, win_h, title, NULL, NULL);
@@ -2094,6 +2122,8 @@ static bool ed_open_path(const char* path) {
     }
 
     glfwSetKeyCallback      (g.ed_window, on_key);
+    glfwSetCharCallback     (g.ed_window, on_ed_char);
+    glfwSetCursorPosCallback(g.ed_window, on_ed_cursor);
     glfwSetMouseButtonCallback(g.ed_window, on_ed_mouse);
     glfwSetDropCallback     (g.ed_window, on_drop);
     plat_window_allow_drops (g.ed_window);
@@ -2107,6 +2137,7 @@ static bool ed_open_path(const char* path) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_DEPTH_TEST);
 
+    an_reset();
     g.ed_open = true;
     g.ed_frame = 0;
     g.ed_trim_in = 0;
@@ -2194,6 +2225,475 @@ static void ed_step(int dir) {
     g.ed_playing = false;
 }
 
+/* ── annotation ─────────────────────────────────────────────────────────
+ * A screenshot is almost never finished when it is taken. Something in it
+ * wants an arrow, a box, or an account number blacked out, and every one of
+ * those is thirty seconds spent in somebody else's program.
+ *
+ * The model is deliberately NOT Greenshot's. Greenshot keeps each annotation
+ * as a live object you can select and move afterwards, which is lovely and
+ * costs a selection model, hit-testing, drag handles, z-order and a document
+ * format. Here a stroke is rasterised into the image the moment you let go of
+ * the mouse, and "I want that arrow somewhere else" is served by undo. One
+ * pixel buffer is the whole document.
+ *
+ * What that buys, beyond the code that does not exist: what you see is
+ * literally what you get. The preview during a drag is produced by the same
+ * paint.h call that commits it, into the same buffer, so the saved PNG cannot
+ * disagree with the screen. An editor that previews on the GPU and saves on
+ * the CPU has two rasterisers, and eventually two answers.
+ */
+
+typedef enum {
+    TOOL_ARROW, TOOL_BOX, TOOL_ELLIPSE, TOOL_LINE, TOOL_PEN,
+    TOOL_MARK, TOOL_PIX, TOOL_TEXT, TOOL_NUM, TOOL_CROP, TOOL_COUNT
+} EdTool;
+
+static const char* TOOL_NAME[TOOL_COUNT] =
+    { "ARR", "BOX", "ELL", "LIN", "PEN", "MRK", "PIX", "TXT", "NUM", "CRP" };
+
+/* Eight colours, not a picker. A picker is a dialog, and the point of this
+ * program is that nothing is a dialog. Red first, because it is red nine
+ * times out of ten. */
+#define AN_NCOLOR 8
+static const uint32_t AN_COLOR[AN_NCOLOR] = {
+    0xE02020, 0xFFD400, 0x20C040, 0x2090FF,
+    0xFF20C0, 0xFFFFFF, 0x101010, 0xFF8000
+};
+
+#define AN_UNDO_MAX 12
+#define AN_BAR_H    30
+#define AN_BTN_W    44
+#define AN_SW_W     20
+
+static struct {
+    EdTool   tool;
+    int      color_idx;
+    int      thick;
+    int      step_next;          /* next NUM counter value */
+
+    int      vx, vy, vw, vh;     /* where the image sits on screen */
+
+    bool     dragging;
+    int      x0, y0, x1, y1;     /* drag, in IMAGE pixels */
+    int      px0, py0, px1, py1; /* previous preview bbox, for the dirty rect */
+    uint8_t* preview;            /* committed image + the stroke in flight */
+    int      pw, ph;
+
+    bool     typing;
+    char     text[80];
+    int      tx, ty;             /* text anchor, in IMAGE pixels */
+
+    uint8_t* undo[AN_UNDO_MAX]; int undo_w[AN_UNDO_MAX], undo_h[AN_UNDO_MAX];
+    uint8_t* redo[AN_UNDO_MAX]; int redo_w[AN_UNDO_MAX], redo_h[AN_UNDO_MAX];
+    int      undo_n, redo_n;
+    bool     dirty;
+} an;
+
+static uint8_t* an_img(void) {
+    return g.ed_r.nframes > 0 ? g.ed_r.frames[0].rgba : NULL;
+}
+static PaintImg an_target(void) {
+    PaintImg im; im.px = an_img(); im.w = g.ed_r.width; im.h = g.ed_r.height;
+    return im;
+}
+static uint32_t an_rgb(void) { return AN_COLOR[an.color_idx]; }
+static bool an_active(void)  { return g.ed_open && g.ed_is_static && an_img(); }
+
+static void an_free_stack(uint8_t** st, int* n) {
+    for (int i = 0; i < *n; i++) { free(st[i]); st[i] = NULL; }
+    *n = 0;
+}
+
+static void an_reset(void) {
+    an_free_stack(an.undo, &an.undo_n);
+    an_free_stack(an.redo, &an.redo_n);
+    free(an.preview); an.preview = NULL; an.pw = an.ph = 0;
+    an.dragging = false;
+    an.typing   = false;
+    an.text[0]  = 0;
+    an.step_next = 1;
+    an.dirty = false;
+    if (an.thick < 1) an.thick = 3;
+}
+
+static void an_retexture(void) { g.ed_main_tex_frame = -1; }
+
+/* Snapshot the whole image before a change. Screenshots are small enough that
+ * copying one is cheaper to write and to reason about than a journal of
+ * inverse operations -- and it makes crop, which changes the dimensions,
+ * exactly as undoable as a pen stroke instead of a special case. */
+static void an_push_undo(void) {
+    uint8_t* src = an_img();
+    if (!src) return;
+    size_t n = (size_t)g.ed_r.width * g.ed_r.height * 4;
+    uint8_t* cp = (uint8_t*)malloc(n);
+    if (!cp) return;
+    memcpy(cp, src, n);
+    if (an.undo_n == AN_UNDO_MAX) {                 /* drop the oldest */
+        free(an.undo[0]);
+        memmove(an.undo,   an.undo   + 1, sizeof(uint8_t*) * (AN_UNDO_MAX - 1));
+        memmove(an.undo_w, an.undo_w + 1, sizeof(int)      * (AN_UNDO_MAX - 1));
+        memmove(an.undo_h, an.undo_h + 1, sizeof(int)      * (AN_UNDO_MAX - 1));
+        an.undo_n--;
+    }
+    an.undo[an.undo_n]   = cp;
+    an.undo_w[an.undo_n] = g.ed_r.width;
+    an.undo_h[an.undo_n] = g.ed_r.height;
+    an.undo_n++;
+    an_free_stack(an.redo, &an.redo_n);             /* a new edit forks time */
+    an.dirty = true;
+}
+
+static void an_swap_image(uint8_t* px, int w, int h) {
+    free(g.ed_r.frames[0].rgba);
+    g.ed_r.frames[0].rgba = px;
+    g.ed_r.width = w; g.ed_r.height = h;
+    free(an.preview); an.preview = NULL; an.pw = an.ph = 0;
+    an_retexture();
+}
+
+static void an_shift(uint8_t** dst, int* dn, int* dw, int* dh,
+                     uint8_t** src, int* sn, int* sw, int* sh) {
+    size_t n = (size_t)g.ed_r.width * g.ed_r.height * 4;
+    uint8_t* cur = (uint8_t*)malloc(n);
+    if (cur) {
+        memcpy(cur, an_img(), n);
+        if (*dn < AN_UNDO_MAX) {
+            dst[*dn] = cur; dw[*dn] = g.ed_r.width; dh[*dn] = g.ed_r.height;
+            (*dn)++;
+        } else free(cur);
+    }
+    (*sn)--;
+    an_swap_image(src[*sn], sw[*sn], sh[*sn]);
+    src[*sn] = NULL;
+}
+
+static void an_undo(void) {
+    if (an.undo_n <= 0) { popup_mode("PNG", "UNDO", "Nothing to undo."); return; }
+    an_shift(an.redo, &an.redo_n, an.redo_w, an.redo_h,
+             an.undo, &an.undo_n, an.undo_w, an.undo_h);
+    an.dirty = true;
+}
+
+static void an_redo(void) {
+    if (an.redo_n <= 0) { popup_mode("PNG", "REDO", "Nothing to redo."); return; }
+    an_shift(an.undo, &an.undo_n, an.undo_w, an.undo_h,
+             an.redo, &an.redo_n, an.redo_w, an.redo_h);
+    an.dirty = true;
+}
+
+/* ---- text -------------------------------------------------------------
+ * The built-in 5x7 font is uppercase-only and looks like a calculator. Fine
+ * for a toolbar; wrong for a label you are putting on a screenshot and
+ * sending to somebody. plat_render_text hands back a coverage mask from the
+ * real system font, and paint_mask does not care which one produced it. */
+static void an_stamp_text(PaintImg im, int x, int y, const char* s,
+                          int px_height, uint32_t rgb) {
+    int mw = 0, mh = 0;
+    uint8_t* mask = plat_render_text(s, px_height, &mw, &mh);
+    if (mask) {
+        paint_mask(im, x, y, mask, mw, mh, rgb);
+        free(mask);
+        return;
+    }
+    int scale = px_height / 7; if (scale < 1) scale = 1;
+    for (const char* p = s; *p; p++) {
+        unsigned char uc = (unsigned char)*p;
+        if (uc >= 'a' && uc <= 'z') uc = (unsigned char)(uc - 'a' + 'A');
+        if (uc < 128) {
+            for (int r = 0; r < 7; r++)
+                for (int c = 0; c < 5; c++)
+                    if (GLYPH[uc][r] & (0x10 >> c))
+                        paint_rect(im, x + c * scale, y + r * scale,
+                                   x + c * scale + scale - 1,
+                                   y + r * scale + scale - 1, rgb, 1, true);
+        }
+        x += 6 * scale;
+    }
+}
+
+static int an_text_px(void) { return an.thick * 5 + 12; }
+
+/* ---- strokes ---------------------------------------------------------- */
+
+/* Draw the tool into `im`. Used for BOTH the live preview and the commit, so
+ * the two cannot drift apart. */
+static void an_stroke(PaintImg im, EdTool tool, int x0, int y0, int x1, int y1) {
+    uint32_t c = an_rgb();
+    switch (tool) {
+    case TOOL_ARROW:   paint_arrow(im, x0, y0, x1, y1, c, an.thick); break;
+    case TOOL_LINE:
+    case TOOL_PEN:     paint_line(im, x0, y0, x1, y1, c, an.thick); break;
+    case TOOL_BOX:     paint_rect(im, x0, y0, x1, y1, c, an.thick, false); break;
+    case TOOL_ELLIPSE: paint_ellipse(im, x0, y0, x1, y1, c, an.thick, false); break;
+    case TOOL_MARK:    paint_highlight(im, x0, y0, x1, y1, c); break;
+    case TOOL_PIX:     paint_pixelate(im, x0, y0, x1, y1, an.thick * 3 + 4); break;
+    case TOOL_NUM: {
+        int r = an.thick * 3 + 8;
+        paint_disc(im, x0, y0, r, c);
+        char lbl[8]; snprintf(lbl, sizeof lbl, "%d", an.step_next);
+        int h = r + 2;
+        an_stamp_text(im, x0 - (int)strlen(lbl) * h / 4, y0 - h / 2,
+                      lbl, h, 0xFFFFFF);
+        break;
+    }
+    default: break;    /* CROP resizes on release; TEXT comes from typing */
+    }
+}
+
+static void an_bbox(int x0, int y0, int x1, int y1,
+                    int* bx0, int* by0, int* bx1, int* by1) {
+    int pad = an.thick * 6 + 24;          /* arrow heads and discs overhang */
+    *bx0 = (x0 < x1 ? x0 : x1) - pad;
+    *bx1 = (x0 > x1 ? x0 : x1) + pad;
+    *by0 = (y0 < y1 ? y0 : y1) - pad;
+    *by1 = (y0 > y1 ? y0 : y1) + pad;
+}
+
+/* Rebuild the preview inside the dirty rect only.
+ *
+ * The naive version -- copy the whole image, draw, upload the whole image --
+ * is a 14 MB memcpy and a 14 MB texture upload per mouse-move event on a
+ * 1440p screenshot, which turns a smooth drag into a slideshow. Restoring and
+ * uploading the union of the last and current bounding boxes keeps it instant
+ * whatever the image size. */
+static void an_preview_update(void) {
+    uint8_t* src = an_img();
+    if (!src) return;
+    int W = g.ed_r.width, H = g.ed_r.height;
+    size_t n = (size_t)W * H * 4;
+    if (!an.preview || an.pw != W || an.ph != H) {
+        free(an.preview);
+        an.preview = (uint8_t*)malloc(n);
+        if (!an.preview) return;
+        memcpy(an.preview, src, n);
+        an.pw = W; an.ph = H;
+        an.px0 = 0; an.py0 = 0; an.px1 = W - 1; an.py1 = H - 1;
+    }
+
+    int bx0, by0, bx1, by1;
+    an_bbox(an.x0, an.y0, an.x1, an.y1, &bx0, &by0, &bx1, &by1);
+    /* Union with the previous box, or last frame's shape stays painted on the
+     * preview after the mouse has moved away from it. */
+    int ux0 = bx0 < an.px0 ? bx0 : an.px0, uy0 = by0 < an.py0 ? by0 : an.py0;
+    int ux1 = bx1 > an.px1 ? bx1 : an.px1, uy1 = by1 > an.py1 ? by1 : an.py1;
+    if (an.tool == TOOL_CROP) { ux0 = 0; uy0 = 0; ux1 = W - 1; uy1 = H - 1; }
+    if (ux0 < 0) ux0 = 0;
+    if (uy0 < 0) uy0 = 0;
+    if (ux1 > W - 1) ux1 = W - 1;
+    if (uy1 > H - 1) uy1 = H - 1;
+    if (ux1 < ux0 || uy1 < uy0) return;
+
+    for (int y = uy0; y <= uy1; y++)
+        memcpy(an.preview + ((size_t)y * W + ux0) * 4,
+               src        + ((size_t)y * W + ux0) * 4,
+               (size_t)(ux1 - ux0 + 1) * 4);
+
+    PaintImg pim; pim.px = an.preview; pim.w = W; pim.h = H;
+    if (an.tool == TOOL_CROP) {
+        /* Show what survives by dimming what does not: reads better than an
+         * outline on a busy screenshot. */
+        int cx0 = an.x0 < an.x1 ? an.x0 : an.x1, cx1 = an.x0 > an.x1 ? an.x0 : an.x1;
+        int cy0 = an.y0 < an.y1 ? an.y0 : an.y1, cy1 = an.y0 > an.y1 ? an.y0 : an.y1;
+        for (int y = uy0; y <= uy1; y++) {
+            uint8_t* p = an.preview + ((size_t)y * W + ux0) * 4;
+            for (int x = ux0; x <= ux1; x++, p += 4) {
+                if (x >= cx0 && x <= cx1 && y >= cy0 && y <= cy1) continue;
+                p[0] = (uint8_t)(p[0] / 3);
+                p[1] = (uint8_t)(p[1] / 3);
+                p[2] = (uint8_t)(p[2] / 3);
+            }
+        }
+        paint_rect(pim, cx0, cy0, cx1, cy1, 0xFFFFFF, 1, false);
+    } else {
+        an_stroke(pim, an.tool, an.x0, an.y0, an.x1, an.y1);
+    }
+
+    an.px0 = bx0; an.py0 = by0; an.px1 = bx1; an.py1 = by1;
+
+    if (g.ed_main_tex) {
+        glBindTexture(GL_TEXTURE_2D, g.ed_main_tex);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, W);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, ux0, uy0,
+                        ux1 - ux0 + 1, uy1 - uy0 + 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE,
+                        an.preview + ((size_t)uy0 * W + ux0) * 4);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    }
+}
+
+static void an_commit(void) {
+    if (an.tool == TOOL_CROP) {
+        int cw = 0, ch = 0;
+        uint8_t* out = paint_crop(an_target(), an.x0, an.y0, an.x1, an.y1, &cw, &ch);
+        if (!out || cw < 4 || ch < 4) { free(out); an_retexture(); return; }
+        an_push_undo();
+        an_swap_image(out, cw, ch);
+        popup_mode("PNG", "CROP", "Cropped to %dx%d.", cw, ch);
+        return;
+    }
+    an_push_undo();
+    an_stroke(an_target(), an.tool, an.x0, an.y0, an.x1, an.y1);
+    if (an.tool == TOOL_NUM) an.step_next++;
+    an_retexture();
+}
+
+static void an_commit_text(void) {
+    if (!an.text[0]) { an.typing = false; return; }
+    an_push_undo();
+    an_stamp_text(an_target(), an.tx, an.ty, an.text, an_text_px(), an_rgb());
+    an.typing = false;
+    an.text[0] = 0;
+    an_retexture();
+}
+
+/* ---- output ----------------------------------------------------------- */
+
+static void an_copy(void) {
+    uint8_t* px = an_img();
+    if (!px) return;
+    plat_clipboard_copy_image(px, g.ed_r.width, g.ed_r.height);
+    popup_mode("PNG", "COPIED", "%dx%d on the clipboard.",
+               g.ed_r.width, g.ed_r.height);
+}
+
+/* Save over the file that is open when it is a PNG, and beside it otherwise.
+ * Overwriting is right here in a way it would not be in a general image
+ * editor: this file is thirty seconds old, this program made it, and the
+ * version anyone wants is the annotated one. */
+static void an_save(void) {
+    uint8_t* px = an_img();
+    if (!px) return;
+    char out[600];
+    snprintf(out, sizeof out, "%s", g.ed_path);
+    if (!path_has_ext(g.ed_path, ".png")) {
+        char* dot = strrchr(out, '.');
+        if (dot) *dot = 0;
+        strncat(out, "_edited.png", sizeof out - strlen(out) - 1);
+    }
+    if (!png_write_rgba(out, px, g.ed_r.width, g.ed_r.height)) {
+        popup_mode("PNG", "SAVE ERR", "Could not write %s", out);
+        return;
+    }
+    an.dirty = false;
+    log_write("edit", "saved %dx%d -> %s", g.ed_r.width, g.ed_r.height, out);
+    popup_mode("PNG", "SAVED", "Saved %dx%d to %s",
+               g.ed_r.width, g.ed_r.height, out);
+    if (g.auto_clipboard) plat_clipboard_copy_file(out);
+}
+
+/* ---- toolbar ----------------------------------------------------------
+ * Hit regions are computed in one place and used by both the drawing and the
+ * clicking, so a button cannot end up somewhere other than where it looks. */
+typedef struct { int x, w, kind, idx; } AnHit;   /* kind 0=tool 1=colour 2=act */
+
+static int an_layout(AnHit* out, int max) {
+    int n = 0, x = 6;
+    for (int i = 0; i < TOOL_COUNT && n < max; i++, n++) {
+        out[n].x = x; out[n].w = AN_BTN_W; out[n].kind = 0; out[n].idx = i;
+        x += AN_BTN_W + 2;
+    }
+    x += 10;
+    for (int i = 0; i < AN_NCOLOR && n < max; i++, n++) {
+        out[n].x = x; out[n].w = AN_SW_W; out[n].kind = 1; out[n].idx = i;
+        x += AN_SW_W + 2;
+    }
+    x += 10;
+    for (int i = 0; i < 5 && n < max; i++, n++) {      /* - + UND CPY SAV */
+        int w = (i < 2) ? 20 : AN_BTN_W;
+        out[n].x = x; out[n].w = w; out[n].kind = 2; out[n].idx = i;
+        x += w + 2;
+    }
+    return n;
+}
+
+static void an_draw_bar(int win_w) {
+    glColor4f(0.12f, 0.12f, 0.15f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f(0, 0); glVertex2f((float)win_w, 0);
+    glVertex2f((float)win_w, (float)AN_BAR_H); glVertex2f(0, (float)AN_BAR_H);
+    glEnd();
+
+    AnHit hit[40];
+    int n = an_layout(hit, 40);
+    for (int i = 0; i < n; i++) {
+        int x = hit[i].x, w = hit[i].w;
+        bool sel = (hit[i].kind == 0 && hit[i].idx == (int)an.tool) ||
+                   (hit[i].kind == 1 && hit[i].idx == an.color_idx);
+        if (hit[i].kind == 1) {
+            uint32_t c = AN_COLOR[hit[i].idx];
+            glColor4f(((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                      (c & 0xFF) / 255.0f, 1.0f);
+        } else {
+            glColor4f(sel ? 0.95f : 0.22f, sel ? 0.55f : 0.22f,
+                      sel ? 0.12f : 0.26f, 1.0f);
+        }
+        glBegin(GL_QUADS);
+        glVertex2f((float)x, 5); glVertex2f((float)(x + w), 5);
+        glVertex2f((float)(x + w), (float)(AN_BAR_H - 4));
+        glVertex2f((float)x, (float)(AN_BAR_H - 4));
+        glEnd();
+
+        if (hit[i].kind != 1) {
+            const char* lbl;
+            char tmp[8];
+            if (hit[i].kind == 0) lbl = TOOL_NAME[hit[i].idx];
+            else {
+                static const char* ACT[5] = { "-", "+", "UND", "CPY", "SAV" };
+                lbl = ACT[hit[i].idx];
+                if (hit[i].idx == 1) {          /* the + key shows the size */
+                    snprintf(tmp, sizeof tmp, "%d", an.thick);
+                    lbl = tmp;
+                }
+            }
+            glColor4f(1, 1, 1, 1);
+            int tw = (int)strlen(lbl) * 12;
+            draw_string_at((float)(x + (w - tw) / 2 + 1), 10.0f, lbl, 2);
+        }
+        if (sel) {
+            glColor4f(1.0f, 0.75f, 0.2f, 1.0f);
+            glLineWidth(2.0f);
+            glBegin(GL_LINE_LOOP);
+            glVertex2f((float)x - 1, 3); glVertex2f((float)(x + w + 1), 3);
+            glVertex2f((float)(x + w + 1), (float)(AN_BAR_H - 2));
+            glVertex2f((float)x - 1, (float)(AN_BAR_H - 2));
+            glEnd();
+        }
+    }
+}
+
+static bool an_bar_click(int mx, int my) {
+    if (my < 0 || my >= AN_BAR_H) return false;
+    AnHit hit[40];
+    int n = an_layout(hit, 40);
+    for (int i = 0; i < n; i++) {
+        if (mx < hit[i].x || mx >= hit[i].x + hit[i].w) continue;
+        if      (hit[i].kind == 0) an.tool = (EdTool)hit[i].idx;
+        else if (hit[i].kind == 1) an.color_idx = hit[i].idx;
+        else switch (hit[i].idx) {
+            case 0: if (an.thick > 1)  an.thick--; break;
+            case 1: if (an.thick < 20) an.thick++; break;
+            case 2: an_undo(); break;
+            case 3: an_copy(); break;
+            case 4: an_save(); break;
+        }
+        return true;
+    }
+    return true;              /* the bar swallows clicks that miss a button */
+}
+
+/* Window pixels to image pixels. Deliberately NOT clamped to the view: a drag
+ * past the edge should clip the shape at the border, which paint.h already
+ * does, rather than drag the corner back inside. */
+static bool an_to_image(int mx, int my, int* ix, int* iy) {
+    if (an.vw <= 0 || an.vh <= 0) return false;
+    int rx = mx - an.vx, ry = my - an.vy;
+    *ix = (int)((int64_t)rx * g.ed_r.width  / an.vw);
+    *iy = (int)((int64_t)ry * g.ed_r.height / an.vh);
+    return rx >= 0 && ry >= 0 && rx < an.vw && ry < an.vh;
+}
+
 static void ed_draw(int win_w, int win_h) {
     glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2204,11 +2704,14 @@ static void ed_draw(int win_w, int win_h) {
     glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
     glDisable(GL_DEPTH_TEST);
 
-    /* Main pane area: everything above the thumbnail strip + button row. */
+    /* Main pane area: everything between the toolbar and the thumbnail strip.
+     * The toolbar only exists for stills -- there is nothing to annotate on a
+     * frame of an animation that the next frame will not throw away. */
     int strip_h = (ed_strip_count() > 0) ? (THUMB_H + 6) : 0;
     int btn_h   = 24;
-    int main_area_h = win_h - strip_h - btn_h;
-    int main_area_top = 0;
+    int bar_h   = an_active() ? AN_BAR_H : 0;
+    int main_area_h = win_h - strip_h - btn_h - bar_h;
+    int main_area_top = bar_h;
     if (main_area_h < 40) main_area_h = 40;
 
     /* Fit main frame with aspect. */
@@ -2220,6 +2723,11 @@ static void ed_draw(int win_w, int win_h) {
     int draw_h = (int)(mh * s);
     int draw_x = (win_w - draw_w) / 2;
     int draw_y = main_area_top + (main_area_h - draw_h) / 2;
+
+    /* Publish where the image landed, so the mouse handler maps clicks with
+     * the same numbers that drew it rather than recomputing the layout and
+     * getting it subtly different. */
+    an.vx = draw_x; an.vy = draw_y; an.vw = draw_w; an.vh = draw_h;
 
     ed_upload_main(g.ed_frame);
     glEnable(GL_TEXTURE_2D);
@@ -2247,7 +2755,24 @@ static void ed_draw(int win_w, int win_h) {
                  g.ed_playing ? "PLAY" : "PAUSE");
     }
     glColor4f(0.9f, 0.9f, 1.0f, 1.0f);
-    draw_string_at(10, 6, info, 2);
+    draw_string_at(10, (float)(bar_h + 4), info, 2);
+
+    if (bar_h) {
+        an_draw_bar(win_w);
+        /* Typing happens on the image, so the caret has to be on the image
+         * too -- a text box somewhere else would make you look away from the
+         * thing you are labelling. */
+        if (an.typing) {
+            int sx = an.vx + (int)((int64_t)an.tx * an.vw / g.ed_r.width);
+            int sy = an.vy + (int)((int64_t)an.ty * an.vh / g.ed_r.height);
+            uint32_t c = an_rgb();
+            glColor4f(((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                      (c & 0xFF) / 255.0f, 1.0f);
+            char line[96];
+            snprintf(line, sizeof line, "%s_", an.text);
+            draw_string_at((float)sx, (float)sy, line, 2);
+        }
+    }
 
     /* Thumbnail strip along the bottom. */
     int strip_top = win_h - strip_h - btn_h;
@@ -2305,7 +2830,8 @@ draw_hints:
     /* Button hint row. */
     glColor4f(0.7f, 0.7f, 0.8f, 1.0f);
     const char* hints = g.ed_is_static
-        ? "  <-/-> OR CLICK THE ARROWS   HOME/END:FIRST/LAST   ESC:CLOSE"
+        ? "  A:ARROW R:BOX E:OVAL L:LINE P:PEN H:MARK X:PIX T:TEXT N:NUM C:CROP  "
+          "[ ]:SIZE 1-8:COLOUR  CTRL+Z/C/S  PGUP/PGDN:FILE  ESC:CLOSE"
         : "  <-/->:STEP  []:TRIM  SPACE:PLAY  S:SAVE  PGUP/PGDN:FILE  ESC:CLOSE";
     draw_string_at(4, (float)(win_h - btn_h + 6), hints, 2);
 
@@ -2375,14 +2901,136 @@ static int ed_arrow_hit(int w, int h, double mx, double my) {
 
 static void ed_step(int dir);   /* defined below */
 
+/* Mouse motion only matters mid-stroke, so this is cheap the rest of the
+ * time. Registered on the editor window in ed_open_path. */
+static void on_ed_cursor(GLFWwindow* win, double mx, double my) {
+    (void)win;
+    if (!an.dragging) return;
+    int ix, iy;
+    an_to_image((int)mx, (int)my, &ix, &iy);
+    if (an.tool == TOOL_PEN) {
+        /* Freehand is a chain of committed segments rather than one shape:
+         * there is no "the stroke so far" to re-preview, and each segment is
+         * already where it belongs. The whole chain still undoes in one go,
+         * because the undo snapshot was taken when the mouse went down. */
+        PaintImg im = an_target();
+        paint_line(im, an.x0, an.y0, ix, iy, an_rgb(), an.thick);
+        an.x0 = ix; an.y0 = iy;
+        an_retexture();
+        return;
+    }
+    an.x1 = ix; an.y1 = iy;
+    an_preview_update();
+}
+
 static void on_ed_mouse(GLFWwindow* win, int button, int action, int mods) {
     (void)mods;
-    if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
     if (!g.ed_open) return;
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
     double mx, my; glfwGetCursorPos(win, &mx, &my);
     int w, h; glfwGetWindowSize(win, &w, &h);
+
+    if (action == GLFW_RELEASE) {
+        if (an.dragging) {
+            an.dragging = false;
+            if (an.tool == TOOL_PEN) { an_retexture(); return; }
+            an_commit();
+        }
+        return;
+    }
+    if (action != GLFW_PRESS) return;
+
+    if (an_active()) {
+        if (an_bar_click((int)mx, (int)my)) return;
+        int ix, iy;
+        if (an_to_image((int)mx, (int)my, &ix, &iy)) {
+            /* A click on the image belongs to the tool. The side chevrons
+             * still work, but only where they are not over the picture --
+             * otherwise every arrow drawn near the edge would page the
+             * folder instead. */
+            if (an.typing) an_commit_text();
+            if (an.tool == TOOL_TEXT) {
+                an.typing = true; an.text[0] = 0; an.tx = ix; an.ty = iy;
+                return;
+            }
+            an.dragging = true;
+            an.x0 = an.x1 = ix; an.y0 = an.y1 = iy;
+            an.px0 = ix; an.py0 = iy; an.px1 = ix; an.py1 = iy;
+            if (an.tool == TOOL_PEN) an_push_undo();
+            else an_preview_update();
+            return;
+        }
+    }
     int hit = ed_arrow_hit(w, h, mx, my);
     if (hit) ed_step(hit);
+}
+
+/* Typed characters, for the text tool. Only consumed while typing, so every
+ * other key keeps its normal meaning. */
+static void on_ed_char(GLFWwindow* win, unsigned int cp) {
+    (void)win;
+    if (!an.typing || cp < 32 || cp > 126) return;
+    size_t n = strlen(an.text);
+    if (n + 1 < sizeof an.text) { an.text[n] = (char)cp; an.text[n + 1] = 0; }
+}
+
+/* Returns true when annotation has taken the key. Placed before the viewer's
+ * own bindings, and only ever active for stills, so nothing an animation
+ * needs is shadowed. */
+static bool an_key(int key, int action, int mods) {
+    if (!an_active()) return false;
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) return false;
+    bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+
+    if (an.typing) {
+        if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) { an_commit_text(); return true; }
+        if (key == GLFW_KEY_ESCAPE) { an.typing = false; an.text[0] = 0; return true; }
+        if (key == GLFW_KEY_BACKSPACE) {
+            size_t n = strlen(an.text);
+            if (n) an.text[n - 1] = 0;
+            return true;
+        }
+        return true;         /* everything else is text, not a shortcut */
+    }
+
+    if (ctrl) {
+        switch (key) {
+        case GLFW_KEY_Z: if (mods & GLFW_MOD_SHIFT) an_redo(); else an_undo(); return true;
+        case GLFW_KEY_Y: an_redo(); return true;
+        case GLFW_KEY_C: an_copy(); return true;
+        case GLFW_KEY_S: an_save(); return true;
+        default: return false;
+        }
+    }
+
+    switch (key) {
+    case GLFW_KEY_A: an.tool = TOOL_ARROW;   return true;
+    case GLFW_KEY_R: an.tool = TOOL_BOX;     return true;
+    case GLFW_KEY_E: an.tool = TOOL_ELLIPSE; return true;
+    case GLFW_KEY_L: an.tool = TOOL_LINE;    return true;
+    case GLFW_KEY_P: an.tool = TOOL_PEN;     return true;
+    case GLFW_KEY_H: an.tool = TOOL_MARK;    return true;
+    case GLFW_KEY_X: an.tool = TOOL_PIX;     return true;
+    case GLFW_KEY_T: an.tool = TOOL_TEXT;    return true;
+    case GLFW_KEY_N: an.tool = TOOL_NUM;     return true;
+    case GLFW_KEY_C: an.tool = TOOL_CROP;    return true;
+    case GLFW_KEY_S: an_save(); return true;   /* not the GIF trim-save */
+    case GLFW_KEY_LEFT_BRACKET:  if (an.thick > 1)  an.thick--; return true;
+    case GLFW_KEY_RIGHT_BRACKET: if (an.thick < 20) an.thick++; return true;
+    case GLFW_KEY_ESCAPE:
+        if (an.dragging) {          /* abandon the stroke, keep the editor */
+            an.dragging = false;
+            an_retexture();
+            return true;
+        }
+        return false;
+    default: break;
+    }
+    if (key >= GLFW_KEY_1 && key <= GLFW_KEY_8) {
+        an.color_idx = key - GLFW_KEY_1;
+        return true;
+    }
+    return false;
 }
 
 static void ed_key(int key, int action) {
@@ -2490,8 +3138,11 @@ static void on_scroll(GLFWwindow* win, double dx, double dy) {
 }
 
 static void on_key(GLFWwindow* win, int key, int sc, int action, int mods) {
-    (void)win; (void)sc; (void)mods;
+    (void)win; (void)sc;
     if (key == GLFW_KEY_F1 && action == GLFW_PRESS) { help_open(); return; }
+    /* Annotation gets first refusal, and only for stills -- so the animation
+     * bindings underneath keep working untouched. */
+    if (an_key(key, action, mods)) return;
     if (g.ed_open) ed_key(key, action);
 }
 
@@ -2723,7 +3374,7 @@ static PlatMenuState menu_state(void) {
     for (int i = 0; i < PLAT_HK_COUNT; i++) st.hotkey_on[i] = g.hotkey_on[i];
     st.auto_open = g.auto_open_folder;
     st.auto_clip = g.auto_clipboard;
-    st.edit_shots = g.edit_shots;
+    st.shot_editor = g.shot_editor;
     st.tray_only = g.tray_only;
     st.audio_src = g.audio_src;
     st.dbl_video = g.dbl_video;
@@ -2820,11 +3471,13 @@ static void handle_menu_command(int cmd) {
         popup(g.auto_open_folder ? "OPEN ON" : "OPEN OFF",
               "Auto-open folder: %s", g.auto_open_folder ? "ON" : "OFF");
         settings_mark_dirty();
-    } else if (cmd == PLAT_MENU_TOGGLE_PAINT) {
-        g.edit_shots = !g.edit_shots;
-        popup_mode("PNG", g.edit_shots ? "PAINT ON" : "PAINT OFF",
-                   "Screenshots %s open in the image editor.",
-                   g.edit_shots ? "now" : "no longer");
+    } else if (cmd >= PLAT_MENU_SHOT_ED_BASE &&
+               cmd <= PLAT_MENU_SHOT_ED_BASE + 2) {
+        g.shot_editor = cmd - PLAT_MENU_SHOT_ED_BASE;
+        static const char* WHAT[3] = { "nothing -- they are just saved",
+                                       "the built-in editor",
+                                       "the system image editor" };
+        popup_mode("PNG", "AFTER", "Screenshots now open %s.", WHAT[g.shot_editor]);
         settings_mark_dirty();
     } else if (cmd == PLAT_MENU_OPEN_EDITOR) {
         char pick[512];
@@ -3139,8 +3792,12 @@ static void save_screenshot(const uint8_t* rgba, int w, int h, const char* label
      * under it -- the shot is what you came for; the folder is where it
      * went. Every screenshot route ends up here, so region, window and the
      * delayed whole-screen capture all behave the same way. */
-    if (g.edit_shots && !plat_open_in_editor(path))
-        log_write("shot", "no image editor could be launched for %s", path);
+    if (g.shot_editor == 1) {
+        snprintf(g.pending_edit, sizeof g.pending_edit, "%s", path);
+    } else if (g.shot_editor == 2) {
+        if (!plat_open_in_editor(path))
+            log_write("shot", "no image editor could be launched for %s", path);
+    }
 }
 
 /* F4: drag a rectangle, get a PNG. */
@@ -3480,7 +4137,7 @@ int main(int argc, char** argv) {
     g.hotkey_on[0] = true;
     g.auto_open_folder = true;
     g.auto_clipboard = true;
-    g.edit_shots     = true;
+    g.shot_editor    = 1;
     g.audio_src      = PLAT_AUDIO_SYSTEM;   /* settings_load may override */
     for (int i = 0; i < PLAT_HK_COUNT; i++) g.hotkey_on[i] = true;
     g.gw_open = false;
@@ -3734,6 +4391,12 @@ int main(int argc, char** argv) {
             orb_sync_from_window();     /* trust the window from here on */
         }
 
+        if (g.pending_edit[0]) {
+            char open_me[600];
+            snprintf(open_me, sizeof open_me, "%s", g.pending_edit);
+            g.pending_edit[0] = 0;
+            ed_open_path(open_me);
+        }
         tick_drag();
         tick_armed_picker();
         tick_recording();
