@@ -157,7 +157,11 @@ typedef struct {
      * saves from a background thread, and creating a window off the main
      * thread is undefined behaviour in GLFW on every platform -- so the path
      * is parked here and opened where windows are allowed to be made. */
-    char pending_edit[700];   /* sized to match save_screenshot's path[] */
+    char pending_edit[700];
+    /* Where pending_edit came from. A capture is a document and gets no
+     * browse chevrons (3.3); a file named on the command line is an entry in
+     * a folder, exactly like a dropped one, and should page like it. */
+    bool pending_is_capture;   /* sized to match save_screenshot's path[] */
     bool tray_only;               /* hide taskbar button, use notification area */
     int  audio_src;               /* PLAT_AUDIO_* for video recording */
     bool dbl_video;               /* double-click arms MP4 rather than GIF */
@@ -1110,7 +1114,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.15",
+    "ORB_RECORDER  v3.16",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -2869,6 +2873,10 @@ static bool an_to_image(int mx, int my, int* ix, int* iy) {
     return rx >= 0 && ry >= 0 && rx < an.vw && ry < an.vh;
 }
 
+/* Width of the browse chevron column down each side of the editor. The
+ * layout reserves it and the hit test uses it, so they cannot disagree. */
+#define ED_ARROW_W 46
+
 static void ed_draw(int win_w, int win_h) {
     glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2890,8 +2898,21 @@ static void ed_draw(int win_w, int win_h) {
     if (main_area_h < 40) main_area_h = 40;
 
     /* Fit main frame with aspect. */
+    /* Leave room for the browse chevrons instead of drawing under them.
+     *
+     * They are painted down each side AFTER the picture, so on a narrow
+     * window they sat on top of it and read as part of the image -- widen the
+     * window far enough and they appeared to "move out", which was really the
+     * picture shrinking away from underneath them. Reserving the columns up
+     * front means the image is never behind a control, at any width.
+     *
+     * Only when they are actually shown: a capture opened straight from a
+     * screenshot has no chevrons (3.3) and should use the whole width. */
     int mw = g.ed_r.width, mh = g.ed_r.height;
-    double sx = (double)(win_w - 20) / mw;
+    int side = g.ed_browsing ? (ED_ARROW_W + 6) : 10;
+    int avail_w = win_w - side * 2;
+    if (avail_w < 40) avail_w = 40;
+    double sx = (double)avail_w / mw;
     double sy = (double)(main_area_h - 20) / mh;
     double s = sx < sy ? sx : sy;
     int draw_w = (int)(mw * s);
@@ -3019,7 +3040,6 @@ draw_hints:
 
 /* Where the on-screen prev/next arrows live, so the painter and the click
  * handler cannot disagree about it. */
-#define ED_ARROW_W 46
 static void ed_arrow_rects(int w, int h, int* lx, int* rx, int* ay, int* ah) {
     int strip_h = (ed_strip_count() > 0) ? (THUMB_H + 6) : 0;
     int btn_h   = 24;
@@ -4051,6 +4071,7 @@ static void save_screenshot_ex(const uint8_t* rgba, int w, int h,
     if (g.shot_editor == 1) {
         /* Truncating here would open the editor on a different file --
          * or on nothing -- so refuse rather than guess. */
+        g.pending_is_capture = true;
         if (snprintf(g.pending_edit, sizeof g.pending_edit, "%s", path)
                 >= (int)sizeof g.pending_edit) {
             g.pending_edit[0] = 0;
@@ -4686,6 +4707,7 @@ int main(int argc, char** argv) {
      * exactly this hand-off. */
     if (argc > 1 && argv[1] && argv[1][0] && argv[1][0] != '-') {
         snprintf(g.pending_edit, sizeof g.pending_edit, "%s", argv[1]);
+        g.pending_is_capture = false;
         log_write("boot", "opening %s from the command line", argv[1]);
     }
 
@@ -4848,7 +4870,8 @@ int main(int argc, char** argv) {
             char open_me[sizeof g.pending_edit];
             snprintf(open_me, sizeof open_me, "%s", g.pending_edit);
             g.pending_edit[0] = 0;
-            if (ed_open_path(open_me)) g.ed_browsing = false;
+            bool from_capture = g.pending_is_capture;
+            if (ed_open_path(open_me) && from_capture) g.ed_browsing = false;
         }
         plat_clipboard_serve();   /* X11 copies are a promise we must keep */
         tick_drag();

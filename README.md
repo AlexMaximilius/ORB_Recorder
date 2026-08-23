@@ -57,6 +57,36 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.16 — the picture stops hiding under the buttons
+
+Reported after dropping a file on the orb: *"the buttons are on top of the
+png, so you see the buttons as part of the image — widen the window enough and
+they move out of the edit area on each side and they work."*
+
+The browse chevrons are painted down each side **after** the picture, and the
+picture was fitted to the whole window width. So on any image bigger than the
+window they overlapped it and read as part of the image. Widening appeared to
+move them out; really the picture was shrinking away from underneath them.
+Because the window size is remembered, it bit once — the first time an image
+arrived that was larger than the window happened to be.
+
+The layout now reserves those columns before fitting, so the image is never
+behind a control at any width. Only when the chevrons are actually shown: a
+capture opened straight from a screenshot has none (3.3) and still uses the
+full width.
+
+**And a file named on the command line now counts as browsing.** 3.15 routed
+`argv` through the same hand-off the capture path uses, which flags its file as
+a document and suppresses the chevrons — so `orb_recorder shot.png` opened
+without any way to page to the next image in the folder. A capture is a
+document; a file you dropped, picked or named on the command line is an entry
+in a folder, and pages like one.
+
+Verified at the width that showed it: a 7280×1440 capture in a 620-pixel
+window, chevrons clear on both sides, image ending before them.
+
+---
+
 ## New in 3.15 — the clipboard was crashing the program
 
 3.11 gave Linux a real clipboard. It also killed the program on the first save
