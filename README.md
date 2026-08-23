@@ -57,6 +57,34 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.12 — it refuses to record nothing
+
+3.8 gave screenshots a way out on Wayland. Recording never had one: GIF and
+MP4 read the X root window frame after frame, and under a compositor that
+window is not the desktop — so pressing F5 produced a valid GIF of pure black
+and announced it as saved. Exactly the failure that made a screenshot say
+*SAVED* over an empty rectangle, still alive in the other half of the program.
+
+It now refuses, and says what still works:
+
+> Recording reads the X root window, which is empty on Wayland, so this would
+> be a GIF of nothing. Screenshots still work — they go through the desktop
+> portal. Log into an Xorg session to record.
+
+The check runs *before* the region selector, because asking someone to drag a
+rectangle and then telling them it was pointless is worse than saying so up
+front.
+
+**Also: the boot log now lists the hotkeys it is holding.** A refused grab was
+already logged, but a grab that succeeds and still never fires looks identical
+from inside the program — and that is the common case on a laptop, where the
+firmware turns the top row into brightness and volume and the key never
+reaches X at all. The line says which keys are held and that the firmware is
+the usual culprit, so the next person to wonder why F4 does nothing has
+somewhere to start.
+
+---
+
 ## New in 3.11 — the clipboard actually exists on Linux
 
 The headline of this program is *take a shot, alt-tab, paste*. On Linux that

@@ -999,6 +999,27 @@ static void build_record_path(void) {
 
 /* Video: same targeting and same capture path as GIF, different encoder.
  * Returns false if video is unavailable on this platform. */
+/* Refuse to record where the frames would be black.
+ *
+ * 3.8 gave screenshots a way out on Wayland -- the desktop portal -- but
+ * recording has none: GIF and MP4 read the X root window frame after frame,
+ * and under a compositor that window is not the desktop. The result was a
+ * perfectly valid GIF of nothing at all, announced as saved, which is the
+ * exact failure that made a screenshot say SAVED over a black rectangle.
+ *
+ * Screenshots are exempt: they no longer go through X at all on Wayland. */
+static bool recording_would_be_blank(const char* what) {
+    const char* why = plat_capture_unavailable();
+    if (!why) return false;
+    log_write("rec", "refused %s: %s", what, why);
+    popup_mode(what, "CANNOT RECORD",
+               "Recording reads the X root window, which is empty on Wayland, "
+               "so this would be a %s of nothing. Screenshots still work -- "
+               "they go through the desktop portal. Log into an Xorg session "
+               "to record.", what);
+    return true;
+}
+
 static bool start_video_common(void) {
     build_record_path();
     /* Swap the extension -- build_record_path() names GIFs. */
@@ -1037,6 +1058,7 @@ static bool start_recording_common(void) {
 }
 
 static void start_recording_window(void* target) {
+    if (recording_would_be_blank("GIF")) return;
     if (!target) { popup("NO WIN", "No valid target window."); return; }
     if (plat_handles_equal(target, g.native)) {
         popup("NOT ORB", "Cannot record the orb itself. Pick another window.");
@@ -1088,7 +1110,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.11",
+    "ORB_RECORDER  v3.12",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1408,6 +1430,7 @@ static bool region_select(int* out_x, int* out_y, int* out_w, int* out_h) {
 }
 
 static void start_recording_region(void) {
+    if (recording_would_be_blank("GIF")) return;
     if (g.state == ORB_RECORDING) { stop_recording(); return; }
     int rx, ry, rw, rh;
     if (!region_select(&rx, &ry, &rw, &rh)) {
@@ -1429,6 +1452,7 @@ static void start_recording_region(void) {
 }
 
 static void start_recording_monitor(PlatMonitor m) {
+    if (recording_would_be_blank("GIF")) return;
     g.targetWindow = NULL;
     g.recordingMonitor = true;
     g.targetMonitor = m;
@@ -3879,6 +3903,7 @@ static void handle_f5(void) {
 
 /* F7: same target as F5 (the focused window), recorded as MP4 with sound. */
 static void start_video_window(void* fg) {
+    if (recording_would_be_blank("MP4")) return;
     g.targetWindow = fg;
     g.recordingMonitor = false;
 
@@ -3928,6 +3953,7 @@ static void handle_f7(void) {
 /* Record an entire monitor as video -- the counterpart to the GIF
  * "Record monitor" item, which existed while video only had window/region. */
 static void start_video_monitor(PlatMonitor m) {
+    if (recording_would_be_blank("MP4")) return;
     if (g.state == ORB_RECORDING) { stop_recording(); return; }
     g.targetWindow = NULL;
     g.recordingMonitor = true;
@@ -4228,6 +4254,9 @@ static void shoot_window_handle(void* fg) {
 /* F8: pick a rectangle (same sheet F6 uses), record it as MP4 with sound. */
 static void handle_f8(void) {
     if (g.state == ORB_RECORDING) { stop_recording(); return; }
+    /* Before the selector, not after: asking someone to drag a rectangle and
+     * then telling them it was pointless is worse than saying so up front. */
+    if (recording_would_be_blank("MP4")) return;
     int rx, ry, rw, rh;
     if (!region_select(&rx, &ry, &rw, &rh)) {
         popup_mode("MP4", "NO BOX", "Region select cancelled.");
@@ -4623,6 +4652,25 @@ int main(int argc, char** argv) {
     /* Honour whatever the settings file says, per key. */
     for (int i = 0; i < PLAT_HK_COUNT; i++) {
         if (g.hotkey_on[i]) apply_hotkey(i, true);
+    }
+    /* Say which keys are actually held.
+     *
+     * A refused grab was already logged, but a grab that SUCCEEDS and still
+     * never fires looks identical from in here -- and that is the common case
+     * on a laptop, where the firmware turns the top row into brightness and
+     * volume and the key never reaches X at all. Printing the list at least
+     * tells whoever is puzzled that the program is holding the key it thinks
+     * it is, and that the machine is eating it before we see it. */
+    {
+        char held[128] = {0};
+        for (int i = 0; i < PLAT_HK_COUNT; i++)
+            if (g.hotkey_on[i]) {
+                strncat(held, HK_NAMES[i], sizeof held - strlen(held) - 2);
+                strncat(held, " ", sizeof held - strlen(held) - 1);
+            }
+        log_write("hotkey", "holding: %s%s", held[0] ? held : "(none) ",
+                  "-- if one never fires, the keyboard firmware is taking it "
+                  "(try Fn, or Fn-lock)");
     }
     if (!g.hotkey_on[0]) {
         popup_mode("F5", "BUSY", "F5 is unavailable or released.");
