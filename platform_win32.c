@@ -319,6 +319,9 @@ static bool apply_taskbar_button(HWND h, bool hidden) {
     return true;                            /* we had to correct it */
 }
 
+/* Shell_NotifyIcon has been there since Windows 95. */
+bool plat_tray_available(void) { return true; }
+
 void plat_tray_set(struct GLFWwindow* w, bool on, const char* tooltip) {
     HWND h = glfwGetWin32Window(w);
     NOTIFYICONDATAA nid;

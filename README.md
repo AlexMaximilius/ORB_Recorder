@@ -57,6 +57,38 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.13 — the orb can no longer be hidden with no way back
+
+On Linux, *Hide orb (tray icon brings it back)* hid the orb and the tray icon
+never appeared. `plat_tray_set` printed a line to stderr and did nothing;
+`plat_poll_tray` always returned "no event". And since 3.5 the orb is
+override-redirect, so it is not in the window list either — no orb, no tray,
+no taskbar entry. The program was still running, invisible, and unreachable
+without hand-editing `settings.ini`.
+
+The code's own comment already said hiding without a tray "would strand the
+user". It was right; nothing checked.
+
+Platforms now declare whether a notification area exists at all, and the core
+asks before hiding anything. Where there is none it refuses and says so — and,
+more importantly, it **rescues a settings file that would strand you**: a
+`tray_only` or `orb_hidden` written on a desktop that had a tray, or before
+this check existed, is ignored with a line in the log rather than obeyed into
+invisibility.
+
+Verified by deliberately stranding it — writing `tray_only=1` and
+`orb_hidden=1` into the settings file, starting the orb, and finding it on
+screen with `no tray on this desktop -- ignoring tray_only/hidden so the orb
+stays reachable` in the log. Windows is untouched: the tray is available
+there, so nothing changes.
+
+*Advertised but unproven:* drag-and-drop onto the orb. GLFW sets `XdndAware`
+on the window, which is the necessary condition, but it has not been tested
+with a real drag — and the orb being override-redirect may matter to some
+file managers.
+
+---
+
 ## New in 3.12 — it refuses to record nothing
 
 3.8 gave screenshots a way out on Wayland. Recording never had one: GIF and

@@ -91,6 +91,16 @@ void plat_draw_orb_2d(struct GLFWwindow* w, int win_size, int orb_size,
  * "Tray only" hides the taskbar button and puts an icon in the notification
  * area instead. Left-click the tray icon to locate the orb (it pings),
  * right-click for the same menu the orb has. */
+/* Is there a notification area to put an icon in?
+ *
+ * This exists because hiding the orb is only survivable if something can
+ * bring it back. plat_tray_set failing quietly is how you end up with no
+ * orb, no tray icon and -- since the orb became override-redirect -- no
+ * entry in the window list either: the program is running, invisible, and
+ * unreachable without editing settings.ini by hand. So the core asks first
+ * rather than hiding and hoping. */
+bool plat_tray_available(void);
+
 void plat_tray_set(struct GLFWwindow* w, bool on, const char* tooltip);
 #define PLAT_TRAY_NONE   0
 #define PLAT_TRAY_LOCATE 1   /* left click  */

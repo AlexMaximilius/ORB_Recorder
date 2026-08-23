@@ -1110,7 +1110,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.12",
+    "ORB_RECORDER  v3.13",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -3656,6 +3656,16 @@ static void handle_menu_command(int cmd) {
                        : (want ? "refused -- another app owns it."
                                : "released to other applications."));
         settings_mark_dirty();
+    } else if (cmd == PLAT_MENU_HIDE_ORB && !plat_tray_available()) {
+        popup_mode("ORB", "NO TRAY",
+                   "There is no notification area on this desktop, so nothing "
+                   "could bring the orb back. Refusing to hide it.");
+        log_write("tray", "refused hide-orb: no tray to restore from");
+    } else if (cmd == PLAT_MENU_TOGGLE_TRAY && !plat_tray_available()) {
+        popup_mode("ORB", "NO TRAY",
+                   "Tray-only needs a notification area, and this desktop has "
+                   "none. The orb stays where you can see it.");
+        log_write("tray", "refused tray-only: no tray on this desktop");
     } else if (cmd == PLAT_MENU_HIDE_ORB) {
         /* Hiding without a tray icon would strand the user: no orb, no
          * taskbar button, no way back short of Task Manager. So switch
@@ -4633,6 +4643,16 @@ int main(int argc, char** argv) {
     /* Only the round part of the square window is the window -- clicks in
      * the transparent corners go to whatever is behind it. */
     orb_apply_region(false);
+    /* Rescue: a settings file written on a desktop that had a tray -- or
+     * before this check existed -- would otherwise hide the orb on every
+     * launch with no way to get it back. */
+    if ((g.tray_only || g_orb_hidden) && !plat_tray_available()) {
+        log_write("tray", "no tray on this desktop -- ignoring tray_only/hidden "
+                          "so the orb stays reachable");
+        g.tray_only = false;
+        g_orb_hidden = false;
+        settings_mark_dirty();
+    }
     if (g.tray_only) {
         plat_tray_set(g.window, true, "ORB_Recorder");
         orb_apply_region(false);        /* the hide/show cycle drops the region */

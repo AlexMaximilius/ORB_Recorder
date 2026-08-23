@@ -199,9 +199,14 @@ void plat_window_allow_drops(struct GLFWwindow* w) { (void)w; }
  * A real tray icon on X11 means XEmbed/StatusNotifierItem and a DBus
  * dependency, which is more than this is worth right now. Report "off" so
  * the core keeps the taskbar button. */
+/* No tray here yet: a real one means XEmbed or StatusNotifierItem over DBus,
+ * which is more than it is worth today. Saying so is the important part --
+ * the core refuses to hide the orb when there is nowhere to bring it back
+ * from, instead of hiding it and stranding whoever asked. */
+bool plat_tray_available(void) { return false; }
+
 void plat_tray_set(struct GLFWwindow* w, bool on, const char* tooltip) {
-    (void)w; (void)tooltip;
-    if (on) fprintf(stderr, "[gif_orb] tray-only is not implemented on X11 yet.\n");
+    (void)w; (void)tooltip; (void)on;
 }
 int plat_poll_tray(void) { return PLAT_TRAY_NONE; }
 
