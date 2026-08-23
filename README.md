@@ -57,6 +57,43 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.15 — the clipboard was crashing the program
+
+3.11 gave Linux a real clipboard. It also killed the program on the first save
+after one, and the orb was found dead the next morning.
+
+The kernel log named it exactly: `segfault at 0 ... error 4 in libc.so.6`, a
+NULL read inside libc, in the same second as *"auto-saved unsaved marks before
+leaving"*. Under gdb the stack was three frames long and unambiguous —
+`strlen()`, called from inside **libglfw**, from `glfwPollEvents()`.
+
+Owning `CLIPBOARD` on **GLFW's own X connection** is the mistake. The instant
+you take ownership, the desktop's clipboard manager sends a `SelectionRequest`
+— and `glfwPollEvents()` handles `SelectionRequest` itself, using the string
+from `glfwSetClipboardString`, which this program never calls. That pointer is
+NULL. `strlen(NULL)`, on the very next poll.
+
+The clipboard now has **its own X connection**, so those events never enter
+GLFW's queue at all. Draining ours first would only have narrowed the race; a
+second connection removes it.
+
+This is the third time on this platform that one component helped itself to
+another's events — the hotkey poll swallowing every keystroke, the zenity menu
+blocking the main loop, and now GLFW eating the clipboard. On X11, "whose
+event is this?" is the question that keeps being answered wrongly.
+
+Reproduced before fixing and re-run after: annotate, `Ctrl+S`, page to the next
+file. **Crashed on round 1; now survives 10 rounds**, and the clipboard still
+serves — `xclip` pulls back an 822×536 PNG afterwards.
+
+**Also: a file on the command line opens in the editor.** `main()` had always
+taken `argv` and never looked at it, so `orb_recorder shot.png` started the orb
+and ignored the argument. That is what a desktop needs to offer this program in
+*Open with*, and it is what made the crash reproducible without a human driving
+a screenshot picker. Verified on both platforms.
+
+---
+
 ## New in 3.14 — the orb is see-through on Linux, not a black disc
 
 Reported from the laptop: *"the orb has a circle that is black not

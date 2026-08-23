@@ -1568,6 +1568,22 @@ void plat_open_with_default_app(const char* path) {
  * GNOME has one -- the content is taken over when we exit, so it outlives us.
  */
 
+/* The clipboard gets its OWN X connection, and that is not tidiness.
+ *
+ * Owning CLIPBOARD on GLFW's connection means the SelectionRequest that a
+ * clipboard manager sends the instant you take ownership lands in GLFW's
+ * event queue. glfwPollEvents() handles SelectionRequest itself, using the
+ * string from glfwSetClipboardString -- which this program never calls, so
+ * that pointer is NULL. strlen(NULL), inside libglfw, on the next poll.
+ *
+ * It killed the program on the first Ctrl+S after a save with auto-clipboard
+ * on. Draining our events first would only narrow the race; a second
+ * connection removes it, because GLFW never sees these events at all.
+ *
+ * This is the third time on this platform that one component has helped
+ * itself to another's events: the hotkey poll swallowing every keystroke, the
+ * menu blocking the main loop, and now GLFW eating the clipboard. */
+static Display* g_clip_dpy = NULL;
 static Window   g_clip_win = 0;
 static uint8_t* g_clip_png = NULL;      /* the image, as PNG bytes */
 static size_t   g_clip_png_len = 0;
@@ -1582,7 +1598,8 @@ static bool path_looks_png(const char* p) {
 
 static void clip_init(void) {
     if (g_clip_win) return;
-    Display* d = dpy();
+    if (!g_clip_dpy) g_clip_dpy = XOpenDisplay(NULL);
+    Display* d = g_clip_dpy;
     if (!d) return;
     A_CLIPBOARD = XInternAtom(d, "CLIPBOARD", False);
     A_TARGETS   = XInternAtom(d, "TARGETS", False);
@@ -1600,8 +1617,8 @@ static void clip_init(void) {
 static void clip_own(void) {
     clip_init();
     if (!g_clip_win) return;
-    XSetSelectionOwner(dpy(), A_CLIPBOARD, g_clip_win, CurrentTime);
-    XFlush(dpy());
+    XSetSelectionOwner(g_clip_dpy, A_CLIPBOARD, g_clip_win, CurrentTime);
+    XFlush(g_clip_dpy);
 }
 
 /* Read the file into memory. Holding the path alone would not be enough: the
@@ -1651,7 +1668,7 @@ void plat_clipboard_copy_image(const uint8_t* rgba, int w, int h) {
 
 /* Answer one SelectionRequest. */
 static void clip_answer(XSelectionRequestEvent* rq) {
-    Display* d = dpy();
+    Display* d = g_clip_dpy;
     XSelectionEvent res;
     memset(&res, 0, sizeof res);
     res.type      = SelectionNotify;
@@ -1711,9 +1728,13 @@ static Bool clip_event(Display* d, XEvent* ev, XPointer arg) {
 }
 
 void plat_clipboard_serve(void) {
-    if (!g_clip_win) return;
+    if (!g_clip_win || !g_clip_dpy) return;
     XEvent ev;
-    while (XCheckIfEvent(dpy(), &ev, clip_event, NULL)) {
+    /* Our own connection, so a plain drain is safe -- nothing else is
+     * listening on it and nothing of GLFW's can be taken by mistake. */
+    while (XPending(g_clip_dpy)) {
+        XNextEvent(g_clip_dpy, &ev);
+        if (!clip_event(g_clip_dpy, &ev, NULL)) continue;
         if (ev.type == SelectionRequest) {
             clip_answer(&ev.xselectionrequest);
         } else if (ev.type == SelectionClear) {

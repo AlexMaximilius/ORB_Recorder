@@ -1110,7 +1110,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.14",
+    "ORB_RECORDER  v3.15",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -4671,6 +4671,22 @@ int main(int argc, char** argv) {
             log_write("boot", "%s", why);
             popup_mode("PNG", "WAYLAND", "%s", why);
         }
+    }
+
+    /* A file on the command line opens in the editor.
+     *
+     * main() has always taken argv and never looked at it, so
+     * `orb_recorder shot.png` started the orb and ignored the argument. That
+     * is the one thing a desktop needs in order to offer this program in
+     * "Open with", and it is also the only way to get the editor onto a
+     * chosen file without a human driving a picker.
+     *
+     * Parked rather than opened here: ed_open_path creates a window, and the
+     * main loop is where windows are made. pending_edit already exists for
+     * exactly this hand-off. */
+    if (argc > 1 && argv[1] && argv[1][0] && argv[1][0] != '-') {
+        snprintf(g.pending_edit, sizeof g.pending_edit, "%s", argv[1]);
+        log_write("boot", "opening %s from the command line", argv[1]);
     }
 
     /* Recording must survive our own popup menus. */
