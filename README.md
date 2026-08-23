@@ -57,6 +57,25 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.17 — the browse buttons look like buttons
+
+Joe: *"they don't seem like buttons."* They did not, and nothing about them was
+button-shaped: a full-height column of 5% white with a small chevron floating
+in the middle of it. That reads as a stripe of the picture, not a control on
+top of one.
+
+They are round now — a dark disc with an amber rim and a heavier chevron —
+and they light up under the pointer: brighter rim, thicker stroke, a couple of
+pixels larger. Compact enough to stop competing with the image for attention,
+and obviously pressable at a glance.
+
+The hit area moved with the look. It used to be the entire side of the window,
+so a click far from any visible control still paged the folder; now it is a
+band around the button. Still forgiving — nobody has to hit a 40-pixel disc
+exactly — but no longer a control you cannot see.
+
+---
+
 ## New in 3.16 — the picture stops hiding under the buttons
 
 Reported after dropping a file on the orb: *"the buttons are on top of the

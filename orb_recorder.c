@@ -1114,7 +1114,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.16",
+    "ORB_RECORDER  v3.17",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -3060,28 +3060,61 @@ static void ed_draw_arrows(int w, int h) {
     ed_arrow_rects(w, h, &lx, &rx, &ay, &ah);
     float cy = (float)(ay + ah / 2);
 
+    /* Round buttons, not faint stripes.
+     *
+     * These used to be a full-height column at 5% white with a small chevron
+     * floating in the middle of it. Joe: "they don't seem like buttons" -- and
+     * they did not, because nothing about them was button-shaped. The tall
+     * rectangle read as a strip of the picture rather than a control sitting
+     * on top of one.
+     *
+     * A disc with a rim and a bright chevron reads as pressable at a glance,
+     * and being compact it stops competing with the image for the eye. */
+    double mx = -1000.0, my = -1000.0;
+    if (g.ed_window) glfwGetCursorPos(g.ed_window, &mx, &my);
+
     for (int side = 0; side < 2; side++) {
         float x0 = (float)(side == 0 ? lx : rx);
-        /* Hit area, barely visible until it matters. */
-        glColor4f(1.0f, 1.0f, 1.0f, 0.05f);
-        glBegin(GL_QUADS);
-        glVertex2f(x0,                 (float)ay);
-        glVertex2f(x0 + ED_ARROW_W,    (float)ay);
-        glVertex2f(x0 + ED_ARROW_W,    (float)(ay + ah));
-        glVertex2f(x0,                 (float)(ay + ah));
+        float cx = x0 + ED_ARROW_W * 0.5f;
+        float r  = ED_ARROW_W * 0.46f;
+
+        /* Under the pointer? Grow slightly and brighten -- the cheapest way to
+         * say "this is the thing you are about to click". */
+        double dx = mx - cx, dy = my - cy;
+        bool hot = (dx * dx + dy * dy) < (double)((r + 6.0f) * (r + 6.0f));
+        if (hot) r += 2.0f;
+
+        /* Body: dark enough to separate from any picture behind it. */
+        glColor4f(0.07f, 0.07f, 0.09f, hot ? 0.92f : 0.72f);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(cx, cy);
+        for (int i = 0; i <= 28; i++) {
+            float a = (float)(2.0 * M_PI * i / 28.0);
+            glVertex2f(cx + cosf(a) * r, cy + sinf(a) * r);
+        }
         glEnd();
 
-        float cx = x0 + ED_ARROW_W * 0.5f;
-        /* Apex points AWAY from centre: left arrow points left. */
-        float d  = (side == 0) ? 1.0f : -1.0f;
-        glColor4f(1.0f, 0.62f, 0.18f, 0.85f);
-        glLineWidth(4.0f);
+        /* Rim. */
+        glColor4f(1.0f, 0.62f, 0.18f, hot ? 1.0f : 0.55f);
+        glLineWidth(hot ? 2.5f : 1.8f);
+        glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < 28; i++) {
+            float a = (float)(2.0 * M_PI * i / 28.0);
+            glVertex2f(cx + cosf(a) * r, cy + sinf(a) * r);
+        }
+        glEnd();
+
+        /* Chevron, apex pointing AWAY from centre. */
+        float d = (side == 0) ? 1.0f : -1.0f;
+        glColor4f(1.0f, hot ? 0.80f : 0.72f, 0.28f, 1.0f);
+        glLineWidth(hot ? 5.0f : 4.0f);
         glBegin(GL_LINE_STRIP);
-        glVertex2f(cx + d * 6.0f,  cy - 14.0f);
-        glVertex2f(cx - d * 6.0f,  cy);
-        glVertex2f(cx + d * 6.0f,  cy + 14.0f);
+        glVertex2f(cx + d * 5.5f,  cy - 10.0f);
+        glVertex2f(cx - d * 5.0f,  cy);
+        glVertex2f(cx + d * 5.5f,  cy + 10.0f);
         glEnd();
     }
+    glLineWidth(1.0f);
 }
 
 /* Returns -1 for the left arrow, +1 for the right, 0 for neither. */
@@ -3089,7 +3122,12 @@ static int ed_arrow_hit(int w, int h, double mx, double my) {
     if (!g.ed_browsing) return 0;
     int lx, rx, ay, ah;
     ed_arrow_rects(w, h, &lx, &rx, &ay, &ah);
-    if (my < ay || my > ay + ah) return 0;
+    /* Anchored on the button now, not the whole side of the window: a control
+     * you cannot see should not be clickable, and the column is reserved for
+     * the button rather than being one. Still generous -- a band around it,
+     * so nobody has to hit a 40-pixel disc exactly. */
+    double cy = ay + ah / 2.0;
+    if (my < cy - (ED_ARROW_W + 10) || my > cy + (ED_ARROW_W + 10)) return 0;
     if (mx >= lx && mx <= lx + ED_ARROW_W) return -1;
     if (mx >= rx && mx <= rx + ED_ARROW_W) return +1;
     return 0;
