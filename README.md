@@ -57,6 +57,41 @@ recording video**, **cyan recording camera**, green editing.
 
 ---
 
+## New in 3.14 — the orb is see-through on Linux, not a black disc
+
+Reported from the laptop: *"the orb has a circle that is black not
+transparent"*. It is in every Linux screenshot further up this page, and it
+had been read as a dark orb on a dark desktop.
+
+The cause is a trade nobody made on purpose. The window asks for
+`GLFW_TRANSPARENT_FRAMEBUFFER` **and** `GLFW_SAMPLES 4`, and on this GLX
+driver the multisampled framebuffer configs carry no alpha. Measured directly:
+
+| hints | result |
+|---|---|
+| no samples | transparent, depth 32 |
+| `SAMPLES 2` | **opaque, depth 24** |
+| `SAMPLES 4` | **opaque, depth 24** |
+| `FLOATING` only | transparent, depth 32 |
+
+Asking for antialiasing silently cost the alpha channel, so every pixel the
+orb did not paint came out black instead of showing the desktop. Nothing
+failed and nothing was logged: the window was created successfully, it just
+was not the window that had been asked for.
+
+Transparency wins now. If the window comes back without alpha it is rebuilt
+without multisampling, and the old one is only kept if the alternative is no
+alpha *either* — losing both would be worse than losing one. The orb's outline
+is cut by the shape region regardless, so all MSAA ever smoothed was the cage
+lines inside it.
+
+Windows is unaffected and keeps both: its transparency comes from a layered
+window rather than an alpha visual, it reports transparent, and no rebuild is
+triggered. Confirmed on both platforms — the laptop's orb window went from
+depth 24 to depth 32, and the Windows boot log shows no rebuild.
+
+---
+
 ## New in 3.13 — the orb can no longer be hidden with no way back
 
 On Linux, *Hide orb (tray icon brings it back)* hid the orb and the tray icon

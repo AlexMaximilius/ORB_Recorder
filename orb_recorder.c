@@ -1110,7 +1110,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.13",
+    "ORB_RECORDER  v3.14",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -4508,6 +4508,42 @@ int main(int argc, char** argv) {
         glfwWindowHint(GLFW_SAMPLES, 0);
         g.window = glfwCreateWindow(ORB_WIN_SIZE, ORB_WIN_SIZE,
                                     "ORB_Recorder", NULL, NULL);
+    }
+
+    /* Transparency beats antialiasing -- and asking for both can cost you the
+     * first one silently.
+     *
+     * Multisampled framebuffer configs on this GLX driver have no alpha: ask
+     * for SAMPLES 4 and the window comes back 24-bit, so every pixel the orb
+     * does not paint is BLACK rather than the desktop. The orb turned into an
+     * opaque disc on Linux and nothing said a word, because the window was
+     * created successfully -- it just was not the window that had been asked
+     * for. Measured on Ubuntu: no samples gives depth 32 and transparency,
+     * SAMPLES 2 or 4 gives depth 24 and none.
+     *
+     * The orb's OUTLINE is cut by the shape region either way, so all MSAA
+     * ever smoothed was the cage lines inside it. That is a small loss; a
+     * black hole where the desktop should be is not. So if the window we got
+     * is not transparent, throw it away and take the one that is. */
+    if (g.window && !glfwGetWindowAttrib(g.window, GLFW_TRANSPARENT_FRAMEBUFFER)) {
+        log_write("boot", "no alpha with multisampling -- rebuilding the window "
+                          "without MSAA so the orb can be see-through");
+        glfwDestroyWindow(g.window);
+        glfwWindowHint(GLFW_SAMPLES, 0);
+        GLFWwindow* clear = glfwCreateWindow(ORB_WIN_SIZE, ORB_WIN_SIZE,
+                                             "ORB_Recorder", NULL, NULL);
+        /* Only take it if it is actually better: a driver with no alpha at
+         * all should keep the antialiased window rather than lose both. */
+        if (clear && glfwGetWindowAttrib(clear, GLFW_TRANSPARENT_FRAMEBUFFER)) {
+            g.window = clear;
+        } else {
+            if (clear) glfwDestroyWindow(clear);
+            log_write("boot", "no transparent visual either -- the orb will be "
+                              "opaque on this display");
+            glfwWindowHint(GLFW_SAMPLES, 4);
+            g.window = glfwCreateWindow(ORB_WIN_SIZE, ORB_WIN_SIZE,
+                                        "ORB_Recorder", NULL, NULL);
+        }
     }
 
     /* Still nothing: no usable GL. Do NOT exit.
