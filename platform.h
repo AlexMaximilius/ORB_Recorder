@@ -172,6 +172,9 @@ enum {
     PLAT_MENU_RUN_AT_STARTUP  = 145,   /* launch when the user logs in     */
     PLAT_MENU_HIDE_ORB        = 146,   /* hide the orb; tray is the way back */
     PLAT_MENU_SHOT_ED_BASE    = 150,   /* +0 nothing +1 built-in +2 system */
+    PLAT_MENU_CLIPHIST_BASE   = 160,   /* +0 off, +1..+3 = keep 5/10/20    */
+#define PLAT_CLIPHIST_CHOICES 4
+    PLAT_MENU_CLIPHIST_LAST   = 163,
     PLAT_MENU_MONITOR_BASE    = 200,   /* GIF:   + monitor index */
     PLAT_MENU_VMONITOR_BASE   = 300,   /* VIDEO: + monitor index */
     PLAT_MENU_CAMERA_BASE     = 400    /* CAMERA: + device index */
@@ -189,6 +192,7 @@ typedef struct {
     int  audio_src;
     bool dbl_video;      /* double-click arms MP4 rather than GIF */
     bool run_at_startup; /* reflects the OS, not a stored preference */
+    int  clip_keep;      /* clipboard entries remembered; 0 = feature off */
 } PlatMenuState;
 
 int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
@@ -292,6 +296,56 @@ void plat_clipboard_copy_file(const char* file_path);
  * straight into a chat box or document rather than as a file attachment.
  * Both are useful and they are different clipboard formats. */
 void plat_clipboard_copy_image(const uint8_t* rgba, int w, int h);
+
+/* Put plain text on the clipboard. Needed to put a remembered entry BACK,
+ * which is the whole point of keeping a history. */
+void plat_clipboard_copy_text(const char* utf8);
+
+/* ---- clipboard history ------------------------------------------------
+ *
+ * The clipboard is a single global slot with no ownership protocol: one
+ * writer, last one wins, no history, no undo, and no notification to the
+ * thing whose data just got thrown away. Everyone has lost something to it.
+ *
+ * Windows 11 ships a history for exactly this reason, but it is wired to an
+ * account and syncs to Microsoft's servers, and the sync is not reliably
+ * separable from the feature. So this is the same idea kept local: it lives
+ * in memory, it is never written to disk, and it never leaves the machine.
+ *
+ * WHAT WE DELIBERATELY DO NOT RECORD
+ * A clipboard history is a password logger unless it is careful, because a
+ * password manager's copy button puts a secret in the same global slot as
+ * everything else. Windows lets the owner say "do not keep this" through two
+ * registered formats, and every serious password manager sets them. We honour
+ * that -- see plat_clipboard_read(). Skipping data the owner asked us to skip
+ * is not a limitation of the feature, it is the feature being trustworthy.
+ */
+enum { PLAT_CLIP_NONE = 0, PLAT_CLIP_TEXT = 1, PLAT_CLIP_IMAGE = 2 };
+
+/* Begin watching the system clipboard. Cheap and idempotent. */
+void plat_clipboard_watch(struct GLFWwindow* w);
+
+/* Has the clipboard changed since the last call? Consumes the flag.
+ *
+ * Event-driven where the platform allows it (WM_CLIPBOARDUPDATE on Windows,
+ * XFixes selection-notify on X11) rather than polled, because polling the
+ * clipboard means repeatedly opening it, and opening it fights with whatever
+ * else is trying to write. */
+bool plat_clipboard_changed(void);
+
+/* Read what is on the clipboard right now.
+ *
+ * Returns PLAT_CLIP_TEXT (with *out_text malloc'd UTF-8), PLAT_CLIP_IMAGE
+ * (with *out_rgba malloc'd, w*h*4), or PLAT_CLIP_NONE -- which also covers
+ * "there is something there but its owner asked us not to keep it". */
+int plat_clipboard_read(char** out_text, uint8_t** out_rgba, int* out_w, int* out_h);
+
+/* ---- a plain list popup ----------------------------------------------
+ * Returns the chosen 0-based index, or -1 for dismissed. Separate from
+ * plat_show_menu() because that one draws a fixed structure of toggles and
+ * submenus, and this one is a list whose contents change every time. */
+int plat_show_list_menu(struct GLFWwindow* w, const char* const* items, int n,
+                        const char* title);
 
 /* Launch at login. Deliberately reads back from the OS rather than from
  * settings.ini: the user can remove the entry outside this program, and a

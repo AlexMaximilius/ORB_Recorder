@@ -52,8 +52,85 @@ whatever else wants it.
 **Drop a file on the orb.** GIFs open a frame editor with trim. Images open
 the annotation editor. Videos open in your default player.
 
+**Middle-click the orb** for clipboard history — the last few things you
+copied, in memory only, never written to disk and never sent anywhere. Off by
+default; anything a password manager marks secret is refused.
+
 Colour is state: orange idle, yellow armed, **red recording GIF**, **magenta
 recording video**, **cyan recording camera**, green editing.
+
+---
+
+## New in 3.18 — clipboard history, kept on your machine
+
+**Middle-click the orb** to see the last few things you copied. Pick one and
+it goes back on the clipboard.
+
+The clipboard is a single global slot with no ownership protocol: one writer,
+last one wins, no history, no undo, and the thing whose data just got thrown
+away is not even told. Everyone has lost something to it.
+
+Windows 11 ships a history for that reason, but it is tied to an account and
+syncs off the machine, and the sync is not cleanly separable from the feature.
+This is the same idea kept local:
+
+- **It lives in memory.** It is never written to disk — not to the settings
+  file, not to the log. Quitting forgets everything.
+- **It never leaves the machine.**
+- **Off by default.** A program that starts remembering everything you copy
+  without being asked is the thing we are offering an alternative to. Turn it
+  on in the right-click menu: *Clipboard history → keep last 5 / 10 / 20*.
+- **Turning it off forgets** what was already held, rather than hiding it.
+
+### It refuses to record secrets
+
+A clipboard history is a password logger unless it is careful, because a
+password manager's *copy* button puts a secret in the same global slot as
+everything else. Both platforms have a way for the owner to say *don't keep
+this*, and this honours all of them:
+
+| platform | marker | who sets it |
+|---|---|---|
+| Windows | `ExcludeClipboardContentFromMonitorProcessing` | KeePass, 1Password, Bitwarden |
+| Windows | `CanIncludeInClipboardHistory` = 0 | same |
+| X11 | `x-kde-passwordManagerHint` = `secret` | KeePassXC, and others following it |
+
+Verified rather than asserted: copying with each marker set produces no entry,
+while an ordinary copy in between is recorded normally.
+
+That care extends to our own diagnostics. Every popup the orb shows is written
+to `log.txt`, so the obvious "put back: *<the text>*" message would have
+quietly copied your clipboard onto disk — the exact thing the feature promises
+not to do, and a log file outlives the process that would otherwise have
+forgotten it. The popup reports the *shape* instead: `Text (142 characters) is
+back on the clipboard.`
+
+### What it took on each platform
+
+**Windows** is the easy side: `AddClipboardFormatListener` gives a real
+`WM_CLIPBOARDUPDATE`, and asking for `CF_BITMAP` rather than `CF_DIB` lets
+Windows synthesize one predictable 32-bit buffer out of whatever DIB variant
+is actually there.
+
+**X11 has no clipboard.** There is no buffer anywhere — the program that
+copied keeps the data and answers requests for it, so *reading* the clipboard
+means asking a stranger for bytes and waiting. Three things follow:
+
+- **There is no change event.** Only XFixes provides one; without it you poll
+  the selection owner, which misses a re-copy from the same window entirely.
+  It is `dlopen`'d, not linked, so a box without it loses the history rather
+  than failing to start.
+- **Anything over ~256 KB arrives in chunks** (the INCR protocol). That is not
+  an exotic case — a copied screenshot is usually bigger than that, so an
+  implementation without INCR would fail on precisely the interesting data.
+  Tested with a 3.1 MB PNG, which round-tripped intact.
+- **You can be your own stranger.** When the orb owns the clipboard and then
+  reads it, it is asking *itself* — so the wait loop has to keep answering
+  requests while it waits, or it deadlocks against its own.
+
+Re-copying something already in the list promotes it instead of duplicating
+it, which is also what stops the change notification that follows a restore
+from adding the entry a second time.
 
 ---
 

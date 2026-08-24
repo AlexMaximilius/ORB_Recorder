@@ -62,6 +62,11 @@
 /* ── config ─────────────────────────────────────────────────────────────── */
 
 #define ORB_SIZE_DEFAULT 68       /* dime, out of the box */
+
+/* Clipboard history caps. Up here rather than beside the code that uses
+ * them because settings_load() clamps to CLIP_MAX and runs long before it. */
+#define CLIP_MAX 20                 /* the largest "keep" the menu offers */
+#define CLIP_BYTES_MAX (64u << 20)  /* whole history, images included */
 #define ORB_SIZE_MIN     36
 #define ORB_SIZE_MAX     240
 #define ORB_SIZE        (g.orb_size)   /* live value -- scroll to resize */
@@ -165,6 +170,7 @@ typedef struct {
     bool tray_only;               /* hide taskbar button, use notification area */
     int  audio_src;               /* PLAT_AUDIO_* for video recording */
     bool dbl_video;               /* double-click arms MP4 rather than GIF */
+    int  clip_keep;               /* clipboard entries remembered; 0 = off */
     bool armed_video;             /* the pick in flight is MP4 */
     int  armed_mode;              /* ARM_* -- what the pick will do */
 
@@ -402,6 +408,8 @@ static void settings_save(void) {
     fprintf(f, "orb_hidden=%d\n", g_orb_hidden ? 1 : 0);
     fprintf(f, "audio_src=%d\n", g.audio_src);
     fprintf(f, "dbl_video=%d\n", g.dbl_video ? 1 : 0);
+    /* The COUNT is remembered; the entries themselves never are. */
+    fprintf(f, "clip_keep=%d\n", g.clip_keep);
     fclose(f);
     g.settings_dirty = false;
     log_write("cfg", "saved orb=(%d,%d) editor=(%d,%d %dx%d)",
@@ -478,6 +486,9 @@ static void settings_load(void) {
         else if (!strcmp(key, "tray_only")) { g.tray_only = val != 0; }
         else if (!strcmp(key, "orb_hidden")) { g_orb_hidden = val != 0; }
         else if (!strcmp(key, "dbl_video")) { g.dbl_video = val != 0; }
+        else if (!strcmp(key, "clip_keep")) {
+            g.clip_keep = (val < 0) ? 0 : (val > CLIP_MAX ? CLIP_MAX : val);
+        }
         else if (!strcmp(key, "audio_src")) {
             g.audio_src = (val >= 0 && val <= 3) ? val : PLAT_AUDIO_SYSTEM;
         }
@@ -1114,7 +1125,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.17",
+    "ORB_RECORDER  v3.18",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1145,6 +1156,15 @@ static const char* HELP_LINES[] = {
     "                  ARMS GIF OR MP4 -- SET IN THE MENU",
     "  RIGHT-CLICK     MENU. HOTKEYS SUBMENU RELEASES ANY",
     "                  KEY BACK TO OTHER APPLICATIONS.",
+    "",
+    "CLIPBOARD HISTORY",
+    "  MIDDLE-CLICK    THE LAST FEW THINGS YOU COPIED.",
+    "                  PICK ONE TO PUT IT BACK.",
+    "  TURN IT ON      RIGHT-CLICK MENU. OFF BY DEFAULT.",
+    "  KEPT IN MEMORY ONLY -- NEVER WRITTEN TO DISK,",
+    "  NEVER SENT ANYWHERE. CLEARED WHEN YOU QUIT.",
+    "  ANYTHING A PASSWORD MANAGER MARKS SECRET",
+    "  IS NOT RECORDED.",
     "",
     "THE ORB",
     "  DRAG            MOVE IT. THE SPOT IS REMEMBERED.",
@@ -3654,6 +3674,216 @@ static void draw_popup_overlay(int w, int h) {
 /* ── input dispatch ───────────────────────────────────────────────────── */
 
 /* Snapshot of everything the menu draws. */
+
+/* ---- clipboard history -------------------------------------------------
+ *
+ * The anti-stomper. The clipboard is one global slot with no ownership
+ * protocol -- last writer wins, no undo, and the loser is not even told. This
+ * keeps the last few things that were in it so a stomp is recoverable.
+ *
+ * Middle-click the orb to see them.
+ *
+ * It lives here in RAM and is never written to disk. That is deliberate: the
+ * reason to have our own rather than use Windows 11's is that Windows 11's is
+ * tied to an account and syncs off the machine. A local history that quietly
+ * persisted your clipboard to a file would be no better -- worse, actually,
+ * because a file survives the reboot that would otherwise have cleared it.
+ */
+
+typedef struct {
+    int      kind;      /* PLAT_CLIP_TEXT or PLAT_CLIP_IMAGE */
+    char*    text;      /* TEXT: malloc'd UTF-8 */
+    uint8_t* rgba;      /* IMAGE: malloc'd w*h*4 */
+    int      w, h;
+    uint64_t hash;      /* content, for dedup */
+    size_t   bytes;
+    char     label[120];/* what the menu shows */
+} ClipEntry;
+
+static ClipEntry g_clips[CLIP_MAX];   /* newest first */
+static int       g_nclips = 0;
+
+static uint64_t clip_hash(const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*)p;
+    uint64_t h = 1469598103934665603ULL;         /* FNV-1a */
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static void clip_free(ClipEntry* e) {
+    free(e->text); free(e->rgba);
+    memset(e, 0, sizeof *e);
+}
+
+/* One line describing an entry, safe to hand to a menu.
+ *
+ * Control characters are flattened to spaces rather than kept: a tab in a
+ * Win32 menu item means "right-align the rest", and a newline would turn one
+ * entry into a mess. Runs collapse so a paragraph reads as a sentence. */
+static void clip_label(ClipEntry* e) {
+    if (e->kind == PLAT_CLIP_IMAGE) {
+        snprintf(e->label, sizeof e->label, "[image  %d x %d]", e->w, e->h);
+        return;
+    }
+    const char* s = e->text ? e->text : "";
+    size_t max_body = 56;
+    /* Sized to what max_body can actually produce, not generously: at 128 the
+     * compiler cannot prove the label fits and warns on every build, and a
+     * warning everyone learns to ignore is worse than no warning. */
+    char buf[64];
+    size_t o = 0;
+    bool sp = false, any = false;
+    size_t i = 0;
+    /* leading whitespace is noise in a preview */
+    while (s[i] && (unsigned char)s[i] <= ' ') i++;
+    for (; s[i] && o < max_body; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < ' ' || c == 0x7f) { sp = true; continue; }
+        if (c == ' ') { sp = true; continue; }
+        if (sp && any) buf[o++] = ' ';
+        sp = false; any = true;
+        if (o < max_body) buf[o++] = (char)c;
+    }
+    /* Do not cut a UTF-8 character in half -- back up to a lead byte. */
+    while (o > 0 && ((unsigned char)buf[o - 1] & 0xC0) == 0x80) o--;
+    if (o > 0 && ((unsigned char)buf[o - 1] & 0xE0) == 0xC0) o--;
+    buf[o] = 0;
+
+    size_t total = strlen(s);
+    if (o == 0)
+        snprintf(e->label, sizeof e->label, "[%zu blank characters]", total);
+    else if (total > o)
+        snprintf(e->label, sizeof e->label, "%s ...   (%zu chars)", buf, total);
+    else
+        snprintf(e->label, sizeof e->label, "%s", buf);
+}
+
+static size_t clip_total_bytes(void) {
+    size_t t = 0;
+    for (int i = 0; i < g_nclips; i++) t += g_clips[i].bytes;
+    return t;
+}
+
+/* Trim to the user's chosen count, and to the memory ceiling. */
+static void clip_trim(void) {
+    int keep = g.clip_keep;
+    if (keep > CLIP_MAX) keep = CLIP_MAX;
+    if (keep < 0) keep = 0;
+    while (g_nclips > keep) clip_free(&g_clips[--g_nclips]);
+    while (g_nclips > 1 && clip_total_bytes() > CLIP_BYTES_MAX)
+        clip_free(&g_clips[--g_nclips]);
+}
+
+/* Insert at the front. Takes ownership of text/rgba either way -- on the
+ * duplicate path it frees them, so callers never have to think about it. */
+/* Returns true only if this became a NEW entry. Callers use that to avoid
+ * reporting work that did not happen: a single Set-Clipboard/Ctrl-C often
+ * fires two change notifications (EmptyClipboard, then SetClipboardData), so
+ * "captured" logged on every notification would double-count every copy. */
+static bool clip_push(int kind, char* text, uint8_t* rgba, int w, int h) {
+    ClipEntry e;
+    memset(&e, 0, sizeof e);
+    e.kind = kind; e.text = text; e.rgba = rgba; e.w = w; e.h = h;
+    if (kind == PLAT_CLIP_TEXT) {
+        e.bytes = text ? strlen(text) + 1 : 0;
+        e.hash  = clip_hash(text ? text : "", e.bytes);
+    } else {
+        e.bytes = (size_t)w * h * 4;
+        e.hash  = clip_hash(rgba, e.bytes);
+    }
+
+    /* Already the newest thing we have? Then this is either the same copy
+     * arriving twice, or our own write coming back at us after the user
+     * picked something out of the history. Neither is a new entry. */
+    if (g_nclips > 0 && g_clips[0].hash == e.hash && g_clips[0].kind == kind) {
+        free(text); free(rgba);
+        return false;
+    }
+    /* Present but further down: promote rather than duplicate. */
+    for (int i = 1; i < g_nclips; i++) {
+        if (g_clips[i].hash == e.hash && g_clips[i].kind == kind) {
+            ClipEntry moved = g_clips[i];
+            memmove(&g_clips[1], &g_clips[0], (size_t)i * sizeof(ClipEntry));
+            g_clips[0] = moved;
+            free(text); free(rgba);
+            return false;
+        }
+    }
+
+    clip_label(&e);
+    if (g_nclips >= CLIP_MAX) clip_free(&g_clips[--g_nclips]);
+    memmove(&g_clips[1], &g_clips[0], (size_t)g_nclips * sizeof(ClipEntry));
+    g_clips[0] = e;
+    g_nclips++;
+    clip_trim();
+    return true;
+}
+
+static void clip_poll(void) {
+    if (g.clip_keep <= 0) return;
+    if (!plat_clipboard_changed()) return;
+    char* text = NULL; uint8_t* rgba = NULL; int w = 0, h = 0;
+    int kind = plat_clipboard_read(&text, &rgba, &w, &h);
+    /* Size and shape only -- never the content. See the note in
+     * clip_show_menu() about the log file being disk. */
+    if (kind == PLAT_CLIP_TEXT && text) {
+        size_t n = strlen(text);
+        if (clip_push(kind, text, NULL, 0, 0))
+            log_write("clip", "captured text, %zu bytes", n);
+    } else if (kind == PLAT_CLIP_IMAGE && rgba) {
+        if (clip_push(kind, NULL, rgba, w, h))
+            log_write("clip", "captured image %dx%d", w, h);
+    }
+    else { free(text); free(rgba); }
+}
+
+/* Middle-click the orb: pick something out of the history and put it back. */
+static void clip_show_menu(void) {
+    if (g.clip_keep <= 0) {
+        popup("CLIPBOARD", "Clipboard history is off. Right-click the orb to "
+                           "turn it on.");
+        return;
+    }
+    if (g_nclips == 0) {
+        popup("CLIPBOARD", "Nothing copied yet.");
+        return;
+    }
+    const char* items[CLIP_MAX];
+    for (int i = 0; i < g_nclips; i++) items[i] = g_clips[i].label;
+
+    char title[64];
+    snprintf(title, sizeof title, "Clipboard  --  last %d", g_nclips);
+    int pick = plat_show_list_menu(g.window, items, g_nclips, title);
+    if (pick < 0 || pick >= g_nclips) return;
+
+    ClipEntry* e = &g_clips[pick];
+    if (e->kind == PLAT_CLIP_TEXT && e->text)  plat_clipboard_copy_text(e->text);
+    else if (e->kind == PLAT_CLIP_IMAGE)       plat_clipboard_copy_image(e->rgba, e->w, e->h);
+
+    /* Most-recently-used: what you just put back IS the clipboard now, so it
+     * belongs at the top -- and being at the top is also what stops the
+     * change notification we are about to get from adding it twice. */
+    if (pick > 0) {
+        ClipEntry moved = g_clips[pick];
+        memmove(&g_clips[1], &g_clips[0], (size_t)pick * sizeof(ClipEntry));
+        g_clips[0] = moved;
+    }
+    /* Deliberately NOT the label.
+     *
+     * popup_l() writes every popup into orb_recorder.log, so showing the
+     * entry here would put clipboard contents on disk -- which is the exact
+     * thing this feature promises not to do, and a log file outlives the
+     * process that would otherwise have forgotten it. Say the shape of what
+     * was restored, never the substance. */
+    if (g_clips[0].kind == PLAT_CLIP_IMAGE)
+        popup("PASTED", "An image (%d x %d) is back on the clipboard.",
+              g_clips[0].w, g_clips[0].h);
+    else
+        popup("PASTED", "Text (%zu characters) is back on the clipboard.",
+              g_clips[0].text ? strlen(g_clips[0].text) : (size_t)0);
+    log_write("clip", "restored entry %d of %d", pick + 1, g_nclips);
+}
+
 static PlatMenuState menu_state(void) {
     PlatMenuState st;
     for (int i = 0; i < PLAT_HK_COUNT; i++) st.hotkey_on[i] = g.hotkey_on[i];
@@ -3663,6 +3893,7 @@ static PlatMenuState menu_state(void) {
     st.tray_only = g.tray_only;
     st.audio_src = g.audio_src;
     st.dbl_video = g.dbl_video;
+    st.clip_keep = g.clip_keep;
     /* Asked of the OS every time the menu opens, not remembered -- the
      * user can remove the entry from Settings and the tick must follow. */
     st.run_at_startup = plat_get_run_at_startup();
@@ -3774,6 +4005,24 @@ static void handle_menu_command(int cmd) {
                                        "the system image editor" };
         popup_mode("PNG", "AFTER", "Screenshots now open %s.", WHAT[g.shot_editor]);
         settings_mark_dirty();
+    } else if (cmd >= PLAT_MENU_CLIPHIST_BASE && cmd <= PLAT_MENU_CLIPHIST_LAST) {
+        static const int CHV[PLAT_CLIPHIST_CHOICES] = { 0, 5, 10, 20 };
+        g.clip_keep = CHV[cmd - PLAT_MENU_CLIPHIST_BASE];
+        if (g.clip_keep > 0) {
+            plat_clipboard_watch(g.window);
+            popup("CLIPBOARD", "Remembering the last %d things you copy. "
+                               "Middle-click the orb to get one back.",
+                  g.clip_keep);
+        } else {
+            /* Off means gone, not hidden: drop what we already hold rather
+             * than leaving it sitting in memory unreachable. */
+            while (g_nclips > 0) clip_free(&g_clips[--g_nclips]);
+            popup("CLIPBOARD", "Clipboard history off. What was remembered "
+                               "has been forgotten.");
+        }
+        clip_trim();
+        settings_mark_dirty();
+        log_write("clip", "history set to keep %d", g.clip_keep);
     } else if (cmd == PLAT_MENU_OPEN_EDITOR) {
         char pick[512];
         if (plat_open_file_dialog(pick, sizeof pick) && ed_open_path(pick))
@@ -3874,6 +4123,8 @@ static void on_mouse_button(GLFWwindow* win, int button, int action, int mods) {
                 g.isDragging = true;
             }
         }
+    } else if (button == GLFW_MOUSE_BUTTON_MIDDLE && action == GLFW_PRESS) {
+        clip_show_menu();
     } else if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
         refresh_monitors();
         PlatMenuState st = menu_state();
@@ -4520,6 +4771,7 @@ int main(int argc, char** argv) {
     g.auto_open_folder = true;
     g.auto_clipboard = true;
     g.shot_editor    = 1;
+    g.clip_keep      = 0;      /* clipboard history is opt-in */
     g.audio_src      = PLAT_AUDIO_SYSTEM;   /* settings_load may override */
     for (int i = 0; i < PLAT_HK_COUNT; i++) g.hotkey_on[i] = true;
     g.gw_open = false;
@@ -4778,6 +5030,14 @@ int main(int argc, char** argv) {
     }
     g.native = plat_get_orb_native_handle(g.window);
     log_write("boot", "window set up; native handle acquired");
+
+    /* Only hook the clipboard if the user actually asked for a history -- no
+     * listener, no events, nothing recorded.
+     *
+     * Has to be here rather than beside settings_load(): the Windows listener
+     * is registered against a window handle, and at settings-load time there
+     * is no window yet, so the call quietly did nothing. */
+    if (g.clip_keep > 0) plat_clipboard_watch(g.window);
     log_write("boot", "integrity: %s",
               plat_process_is_elevated() ? "ELEVATED (admin)" : "normal user");
 
@@ -4855,6 +5115,7 @@ int main(int argc, char** argv) {
             if (hk == PLAT_HK_ESCAPE) handle_escape();
         }
         glfwPollEvents();
+        clip_poll();
 
         /* Brought forward, restored, or the tray icon clicked -> locate. */
         if (plat_poll_activation()) ping_start_for(PING_MS_LONG);

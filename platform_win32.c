@@ -210,6 +210,11 @@ static volatile LONG g_activation   = 0;
 static volatile LONG g_tray_event = 0;
 static bool          g_tray_on    = false;
 
+/* Clipboard history: the OS tells us when the slot changed, so we never
+ * have to poll it. Polling would mean opening the clipboard on a timer,
+ * and opening it fights with whatever else is trying to write to it. */
+static volatile LONG g_clip_change = 0;
+
 /* Called from WM_TIMER while a modal loop has the thread. See
  * plat_set_modal_tick() in platform.h for why this exists. */
 static PlatModalTickFn g_modal_tick = NULL;
@@ -247,6 +252,9 @@ static LRESULT CALLBACK orb_subclass_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp
     case WM_SHOWWINDOW:
         /* Restored from minimised / re-shown -- worth a locate flash. */
         if (wp) InterlockedExchange(&g_activation, 1);
+        break;
+    case WM_CLIPBOARDUPDATE:
+        InterlockedExchange(&g_clip_change, 1);
         break;
     case WM_ORB_TRAY:
         if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK)
@@ -879,6 +887,20 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
             AppendMenuA(se, MF_STRING | (st->shot_editor == i ? MF_CHECKED : 0),
                         PLAT_MENU_SHOT_ED_BASE + (UINT)i, SEN[i]);
         AppendMenuA(root, MF_POPUP, (UINT_PTR)se, "After a screenshot, open >");
+    }
+    {
+        /* Clipboard history. Off by default -- a program that starts
+         * remembering everything you copy without being asked is exactly the
+         * thing we are offering an alternative to. */
+        HMENU ch = CreatePopupMenu();
+        static const char* CHN[PLAT_CLIPHIST_CHOICES] = {
+            "Off", "Keep last 5", "Keep last 10", "Keep last 20" };
+        static const int CHV[PLAT_CLIPHIST_CHOICES] = { 0, 5, 10, 20 };
+        for (int i = 0; i < PLAT_CLIPHIST_CHOICES; i++)
+            AppendMenuA(ch, MF_STRING | (st->clip_keep == CHV[i] ? MF_CHECKED : 0),
+                        PLAT_MENU_CLIPHIST_BASE + (UINT)i, CHN[i]);
+        AppendMenuA(root, MF_POPUP, (UINT_PTR)ch,
+                    "Clipboard history (middle-click) >");
     }
     AppendMenuA(root, MF_STRING | (st->tray_only ? MF_CHECKED : MF_UNCHECKED),
                 PLAT_MENU_TOGGLE_TRAY,     "Tray icon only");
@@ -1620,6 +1642,219 @@ void plat_clipboard_copy_file(const char* file_path) {
     } else {
         GlobalFree(hg);
     }
+}
+
+/* ---- clipboard history -------------------------------------------------
+ *
+ * See platform.h for why this exists and what it refuses to record.
+ */
+
+void plat_clipboard_copy_text(const char* utf8) {
+    if (!utf8) return;
+    int wn = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wn <= 0) return;
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (size_t)wn * sizeof(WCHAR));
+    if (!hg) return;
+    WCHAR* w = (WCHAR*)GlobalLock(hg);
+    if (!w) { GlobalFree(hg); return; }
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, wn);
+    GlobalUnlock(hg);
+
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_UNICODETEXT, hg);   /* clipboard owns hg now */
+        CloseClipboard();
+    } else {
+        GlobalFree(hg);
+    }
+}
+
+void plat_clipboard_watch(struct GLFWwindow* w) {
+    static bool started = false;
+    if (started || !w) return;
+    HWND h = glfwGetWin32Window(w);
+    if (!h) return;
+    if (AddClipboardFormatListener(h)) {
+        started = true;
+        /* Take what is already there as the first entry. The exclusion flags
+         * below are properties of the clipboard CONTENT, not of the moment it
+         * was copied, so a secret sitting there at launch is still protected. */
+        InterlockedExchange(&g_clip_change, 1);
+    }
+}
+
+bool plat_clipboard_changed(void) {
+    return InterlockedExchange(&g_clip_change, 0) != 0;
+}
+
+/* Did whoever put this here ask us not to keep it?
+ *
+ * Two registered formats, both Microsoft-documented, both set by every
+ * password manager worth using (KeePass, Bitwarden, 1Password):
+ *
+ *   ExcludeClipboardContentFromMonitorProcessing -- present at all means
+ *       "no clipboard monitor should touch this", the stronger of the two.
+ *   CanIncludeInClipboardHistory -- a DWORD; 0 means "not in any history".
+ *
+ * Must be called with the clipboard already open, because reading the second
+ * one needs GetClipboardData. */
+static bool clip_owner_forbids(void) {
+    static UINT f_excl = 0, f_hist = 0;
+    if (!f_excl) f_excl = RegisterClipboardFormatA(
+                              "ExcludeClipboardContentFromMonitorProcessing");
+    if (!f_hist) f_hist = RegisterClipboardFormatA("CanIncludeInClipboardHistory");
+
+    if (f_excl && IsClipboardFormatAvailable(f_excl)) return true;
+
+    if (f_hist && IsClipboardFormatAvailable(f_hist)) {
+        HANDLE h = GetClipboardData(f_hist);
+        if (h) {
+            DWORD* v = (DWORD*)GlobalLock(h);
+            if (v) {
+                bool no = (*v == 0);
+                GlobalUnlock(h);
+                if (no) return true;
+            }
+        }
+    }
+    return false;
+}
+
+int plat_clipboard_read(char** out_text, uint8_t** out_rgba, int* out_w, int* out_h) {
+    if (out_text) *out_text = NULL;
+    if (out_rgba) *out_rgba = NULL;
+    if (out_w)    *out_w = 0;
+    if (out_h)    *out_h = 0;
+
+    /* Another process can hold the clipboard open for a moment right after
+     * writing it, which is precisely when we get told it changed. Retry a few
+     * times rather than dropping the entry. */
+    int opened = 0;
+    for (int try_i = 0; try_i < 8 && !opened; try_i++) {
+        opened = OpenClipboard(NULL);
+        if (!opened) Sleep(15);
+    }
+    if (!opened) return PLAT_CLIP_NONE;
+
+    int kind = PLAT_CLIP_NONE;
+
+    if (clip_owner_forbids()) {
+        CloseClipboard();
+        return PLAT_CLIP_NONE;
+    }
+
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        HANDLE h = GetClipboardData(CF_UNICODETEXT);
+        WCHAR* w = h ? (WCHAR*)GlobalLock(h) : NULL;
+        if (w) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+            /* A cap, because this lives in RAM and someone will eventually
+             * copy a log file into it. */
+            if (n > 0 && n <= 1024 * 1024) {
+                char* t = (char*)malloc((size_t)n);
+                if (t) {
+                    WideCharToMultiByte(CP_UTF8, 0, w, -1, t, n, NULL, NULL);
+                    if (out_text) *out_text = t; else free(t);
+                    kind = PLAT_CLIP_TEXT;
+                }
+            }
+            GlobalUnlock(h);
+        }
+    } else if (IsClipboardFormatAvailable(CF_BITMAP)) {
+        /* CF_BITMAP rather than CF_DIB deliberately: Windows synthesizes it
+         * from whatever DIB variant is actually there, so GetDIBits gives us
+         * one predictable 32-bit top-down buffer instead of us hand-decoding
+         * 24-bit, BI_BITFIELDS and DIBv5 separately.
+         *
+         * Alpha is forced opaque -- the synthesized bitmap does not carry it,
+         * and a half-transparent paste is worse than an opaque one. */
+        HBITMAP hb = (HBITMAP)GetClipboardData(CF_BITMAP);
+        BITMAP bm;
+        if (hb && GetObject(hb, sizeof bm, &bm) &&
+            bm.bmWidth > 0 && bm.bmHeight > 0 &&
+            bm.bmWidth <= 16384 && bm.bmHeight <= 16384) {
+
+            size_t px = (size_t)bm.bmWidth * bm.bmHeight * 4;
+            uint8_t* buf = (uint8_t*)malloc(px);
+            if (buf) {
+                BITMAPINFO bi;
+                memset(&bi, 0, sizeof bi);
+                bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth       = bm.bmWidth;
+                bi.bmiHeader.biHeight      = -bm.bmHeight;   /* top-down */
+                bi.bmiHeader.biPlanes      = 1;
+                bi.bmiHeader.biBitCount    = 32;
+                bi.bmiHeader.biCompression = BI_RGB;
+
+                HDC dc = GetDC(NULL);
+                int got = GetDIBits(dc, hb, 0, (UINT)bm.bmHeight, buf,
+                                    &bi, DIB_RGB_COLORS);
+                ReleaseDC(NULL, dc);
+
+                if (got) {
+                    for (size_t i = 0; i < px; i += 4) {
+                        uint8_t b = buf[i];
+                        buf[i]     = buf[i + 2];   /* BGRA -> RGBA */
+                        buf[i + 2] = b;
+                        buf[i + 3] = 255;
+                    }
+                    if (out_rgba) *out_rgba = buf; else free(buf);
+                    if (out_w) *out_w = bm.bmWidth;
+                    if (out_h) *out_h = bm.bmHeight;
+                    kind = PLAT_CLIP_IMAGE;
+                } else {
+                    free(buf);
+                }
+            }
+        }
+    }
+
+    CloseClipboard();
+    return kind;
+}
+
+/* ---- a plain list popup ------------------------------------------------ */
+int plat_show_list_menu(struct GLFWwindow* w, const char* const* items, int n,
+                        const char* title) {
+    if (!w || n <= 0) return -1;
+    HWND h = glfwGetWin32Window(w);
+    HMENU m = CreatePopupMenu();
+    if (!m) return -1;
+
+    if (title && *title) {
+        AppendMenuA(m, MF_STRING | MF_DISABLED | MF_GRAYED, 0, title);
+        AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    }
+    for (int i = 0; i < n; i++) {
+        /* '&' in a menu string is an accelerator marker and would vanish,
+         * turning "a&b" into "ab" with a underlined. Clipboard entries are
+         * arbitrary text -- URLs are full of them -- so double each one. */
+        char esc[256];
+        {
+            const char* src = items[i] ? items[i] : "";
+            size_t o = 0;
+            for (size_t k = 0; src[k] && o < sizeof esc - 2; k++) {
+                if (src[k] == '&') esc[o++] = '&';
+                esc[o++] = src[k];
+            }
+            esc[o] = 0;
+        }
+        WCHAR wbuf[512];
+        if (MultiByteToWideChar(CP_UTF8, 0, esc, -1, wbuf, 512) <= 0)
+            wbuf[0] = 0;
+        /* Item ids are 1-based: TrackPopupMenu returns 0 for "dismissed". */
+        AppendMenuW(m, MF_STRING, (UINT_PTR)(i + 1), wbuf);
+    }
+
+    POINT p; GetCursorPos(&p);
+    SetTimer(h, ORB_MODAL_TIMER_ID, 30, NULL);   /* keep recording alive */
+    SetForegroundWindow(h);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN,
+                             p.x, p.y, 0, h, NULL);
+    KillTimer(h, ORB_MODAL_TIMER_ID);
+    DestroyMenu(m);
+    PostMessage(h, WM_NULL, 0, 0);
+    return cmd > 0 ? cmd - 1 : -1;
 }
 
 /* ---- background jobs --------------------------------------------------

@@ -789,9 +789,10 @@ static char* which(const char* prog) {
 #define MENU_MAX     64
 
 typedef struct {
-    char label[72];
+    char label[128];  /* clipboard previews are longer than menu commands */
     int  id;          /* PLAT_MENU_* , or 0 for a separator */
     int  sep;
+    int  dim;         /* drawn, but not selectable -- a heading */
 } MenuRow;
 
 static PlatModalTickFn g_x11_modal_tick = NULL;
@@ -805,6 +806,17 @@ static int menu_add(MenuRow* rows, int n, int id, const char* fmt, ...) {
     va_end(ap);
     rows[n].id = id;
     rows[n].sep = 0;
+    rows[n].dim = 0;
+    return n + 1;
+}
+
+/* A row that is drawn but cannot be picked -- a heading. */
+static int menu_head(MenuRow* rows, int n, const char* text) {
+    if (n >= MENU_MAX) return n;
+    snprintf(rows[n].label, sizeof rows[n].label, "%s", text);
+    rows[n].id = 0;
+    rows[n].sep = 0;
+    rows[n].dim = 1;
     return n + 1;
 }
 
@@ -813,8 +825,11 @@ static int menu_sep(MenuRow* rows, int n) {
     rows[n].label[0] = 0;
     rows[n].id = 0;
     rows[n].sep = 1;
+    rows[n].dim = 0;
     return n + 1;
 }
+
+static int menu_run(Display* d, MenuRow* rows, int n);
 
 static const char* onoff(bool b) { return b ? "[on] " : "[  ] "; }
 
@@ -871,6 +886,16 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
     n = menu_sep(rows, n);
     n = menu_add(rows, n, PLAT_MENU_QUIT,          "Quit");
 
+    return menu_run(d, rows, n);
+}
+
+/* Draw a set of rows, let the user pick one, return its id (0 = dismissed).
+ *
+ * Split out of plat_show_menu so the clipboard history can reuse it: that is
+ * a list whose contents change every time rather than a fixed set of
+ * commands, but the window, the grabs, the hover painting and the modal tick
+ * are all identical, and a second copy of them would drift. */
+static int menu_run(Display* d, MenuRow* rows, int n) {
     /* ---- font ---- */
     XFontStruct* fnt = XLoadQueryFont(d, "-*-dejavu sans mono-medium-r-*--13-*");
     if (!fnt) fnt = XLoadQueryFont(d, "9x15");
@@ -937,7 +962,8 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                 int y = 6, h2 = -1;
                 for (int i = 0; i < n; i++) {
                     int rh = rows[i].sep ? (MENU_ROW_H / 2) : MENU_ROW_H;
-                    if (ev.xmotion.y >= y && ev.xmotion.y < y + rh && !rows[i].sep)
+                    if (ev.xmotion.y >= y && ev.xmotion.y < y + rh &&
+                        !rows[i].sep && !rows[i].dim)
                         h2 = i;
                     y += rh;
                 }
@@ -960,7 +986,7 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                         i += dir;
                         if (i < 0) i = n - 1;
                         if (i >= n) i = 0;
-                        if (!rows[i].sep) break;
+                        if (!rows[i].sep && !rows[i].dim) break;
                     }
                     hover = i;
                 } else if (ks == XK_Return || ks == XK_KP_Enter) {
@@ -980,7 +1006,9 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                 XSetForeground(d, gc, 0x3A3A42);
                 XDrawLine(d, mw, gc, 8, y + rh / 2, wpx - 8, y + rh / 2);
             } else {
-                if (i == hover) {
+                if (rows[i].dim) {
+                    XSetForeground(d, gc, 0x8A8A96);   /* a heading, not a choice */
+                } else if (i == hover) {
                     XSetForeground(d, gc, 0xF08A1E);
                     XFillRectangle(d, mw, gc, 2, y, (unsigned)(wpx - 4), (unsigned)rh);
                     XSetForeground(d, gc, 0x1A1A1E);
@@ -1590,6 +1618,23 @@ static size_t   g_clip_png_len = 0;
 static char     g_clip_path[700];       /* the file, for a file-manager paste */
 
 static Atom A_CLIPBOARD, A_TARGETS, A_PNG, A_URILIST, A_UTF8, A_STRING, A_TEXT;
+static Atom A_INCR, A_PROP_IN, A_KDE_PASSWORD;
+static char* g_clip_text = NULL;        /* text we are offering, if any */
+
+/* XFixes, dlopen'd rather than linked.
+ *
+ * X has no "the clipboard changed" event of its own -- the only portable way
+ * to notice is to keep asking who owns the selection, which misses a re-copy
+ * from the same window entirely. XFixes adds the notification properly. It is
+ * present on every desktop in practice, but making it a link-time dependency
+ * would stop the binary starting on a box without it, for the sake of one
+ * optional feature. dlopen means it degrades instead: no XFixes, no history,
+ * everything else still runs. */
+typedef Bool (*fn_xfixes_query)(Display*, int*, int*);
+typedef void (*fn_xfixes_select)(Display*, Window, Atom, unsigned long);
+static fn_xfixes_select p_xfixes_select = NULL;
+static int   g_xfixes_evbase = -1;
+static int   g_clip_changed  = 0;
 
 static bool path_looks_png(const char* p) {
     size_t n = strlen(p);
@@ -1608,6 +1653,11 @@ static void clip_init(void) {
     A_UTF8      = XInternAtom(d, "UTF8_STRING", False);
     A_STRING    = XInternAtom(d, "STRING", False);
     A_TEXT      = XInternAtom(d, "TEXT", False);
+    A_INCR      = XInternAtom(d, "INCR", False);
+    A_PROP_IN   = XInternAtom(d, "ORB_CLIP_IN", False);
+    /* KeePassXC and friends set this on a secret they put on the clipboard.
+     * It is the closest thing X has to Windows' exclusion formats. */
+    A_KDE_PASSWORD = XInternAtom(d, "x-kde-passwordManagerHint", False);
     /* An unmapped 1x1 window that exists only to be a selection owner. */
     g_clip_win = XCreateSimpleWindow(d, DefaultRootWindow(d), -10, -10, 1, 1,
                                      0, 0, 0);
@@ -1644,6 +1694,7 @@ static void clip_load_png(const char* path) {
 }
 
 void plat_clipboard_copy_file(const char* file_path) {
+    free(g_clip_text); g_clip_text = NULL;
     snprintf(g_clip_path, sizeof g_clip_path, "%s", file_path);
     if (path_looks_png(file_path)) clip_load_png(file_path);
     clip_own();
@@ -1656,6 +1707,8 @@ int png_write_rgba(const char* path, const uint8_t* rgba, int w, int h);
 
 void plat_clipboard_copy_image(const uint8_t* rgba, int w, int h) {
     if (!rgba || w <= 0 || h <= 0) return;
+    free(g_clip_text); g_clip_text = NULL;
+    g_clip_path[0] = 0;
     const char* run = getenv("XDG_RUNTIME_DIR");
     char tmp[512];
     snprintf(tmp, sizeof tmp, "%s/orb_clip.png", run && run[0] ? run : "/tmp");
@@ -1686,8 +1739,8 @@ static void clip_answer(XSelectionRequestEvent* rq) {
         int n = 0;
         offer[n++] = A_TARGETS;
         if (g_clip_png) offer[n++] = A_PNG;
-        if (g_clip_path[0]) {
-            offer[n++] = A_URILIST;
+        if (g_clip_path[0]) offer[n++] = A_URILIST;
+        if (g_clip_path[0] || g_clip_text) {
             offer[n++] = A_UTF8;
             offer[n++] = A_STRING;
             offer[n++] = A_TEXT;
@@ -1705,11 +1758,19 @@ static void clip_answer(XSelectionRequestEvent* rq) {
         XChangeProperty(d, rq->requestor, prop, A_URILIST, 8, PropModeReplace,
                         (unsigned char*)uri, n);
         res.property = prop;
-    } else if ((rq->target == A_UTF8 || rq->target == A_STRING ||
-                rq->target == A_TEXT) && g_clip_path[0]) {
-        XChangeProperty(d, rq->requestor, prop, rq->target, 8, PropModeReplace,
-                        (unsigned char*)g_clip_path, (int)strlen(g_clip_path));
-        res.property = prop;
+    } else if (rq->target == A_UTF8 || rq->target == A_STRING ||
+               rq->target == A_TEXT) {
+        /* Real text wins over the file path: if the user picked a text entry
+         * out of the history, that text IS the clipboard, and handing over a
+         * filename instead would paste the wrong thing entirely. */
+        const char* txt = g_clip_text ? g_clip_text
+                                      : (g_clip_path[0] ? g_clip_path : NULL);
+        if (txt) {
+            XChangeProperty(d, rq->requestor, prop, rq->target, 8,
+                            PropModeReplace, (const unsigned char*)txt,
+                            (int)strlen(txt));
+            res.property = prop;
+        }
     }
     XSendEvent(d, rq->requestor, False, 0, (XEvent*)&res);
     XFlush(d);
@@ -1734,6 +1795,12 @@ void plat_clipboard_serve(void) {
      * listening on it and nothing of GLFW's can be taken by mistake. */
     while (XPending(g_clip_dpy)) {
         XNextEvent(g_clip_dpy, &ev);
+        /* XFixesSelectionNotify is the first of the extension's events, so
+         * its type is exactly the event base we were given. */
+        if (g_xfixes_evbase >= 0 && ev.type == g_xfixes_evbase) {
+            g_clip_changed = 1;
+            continue;
+        }
         if (!clip_event(g_clip_dpy, &ev, NULL)) continue;
         if (ev.type == SelectionRequest) {
             clip_answer(&ev.xselectionrequest);
@@ -1744,8 +1811,253 @@ void plat_clipboard_serve(void) {
             g_clip_png = NULL;
             g_clip_png_len = 0;
             g_clip_path[0] = 0;
+            free(g_clip_text);
+            g_clip_text = NULL;
         }
     }
+}
+
+/* ---- clipboard history (X11) ------------------------------------------
+ *
+ * See platform.h for what this is for. The X-specific problems it solves:
+ *
+ *  - X has no clipboard. The "copy" side keeps the data and serves it on
+ *    request, so reading the clipboard means asking a stranger for bytes and
+ *    waiting for them to answer.
+ *  - There is no change event without XFixes, dlopen'd above.
+ *  - Anything over ~256 KB arrives in chunks (INCR). That is not an exotic
+ *    case: a copied screenshot is usually bigger than that, so an
+ *    implementation without INCR would fail on exactly the interesting data.
+ */
+
+/* stb_image is compiled into the core translation unit. Declared rather than
+ * included so this file does not end up carrying a second copy of it. */
+extern unsigned char* stbi_load_from_memory(const unsigned char* buf, int len,
+                                            int* x, int* y, int* ch, int want);
+
+void plat_clipboard_copy_text(const char* utf8) {
+    if (!utf8) return;
+    clip_init();
+    free(g_clip_text);
+    g_clip_text = strdup(utf8);
+    free(g_clip_png); g_clip_png = NULL; g_clip_png_len = 0;
+    g_clip_path[0] = 0;
+    clip_own();
+}
+
+void plat_clipboard_watch(struct GLFWwindow* w) {
+    (void)w;
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
+
+    clip_init();
+    if (!g_clip_dpy || !g_clip_win) return;
+
+    void* lib = dlopen("libXfixes.so.3", RTLD_LAZY);
+    if (!lib) lib = dlopen("libXfixes.so", RTLD_LAZY);
+    if (!lib) {
+        fprintf(stderr, "[orb] libXfixes not present -- clipboard history off\n");
+        return;
+    }
+    fn_xfixes_query q = (fn_xfixes_query)dlsym(lib, "XFixesQueryExtension");
+    p_xfixes_select   = (fn_xfixes_select)dlsym(lib, "XFixesSelectSelectionInput");
+    int errbase = 0;
+    if (!q || !p_xfixes_select || !q(g_clip_dpy, &g_xfixes_evbase, &errbase)) {
+        p_xfixes_select = NULL;
+        g_xfixes_evbase = -1;
+        fprintf(stderr, "[orb] XFixes unusable -- clipboard history off\n");
+        return;
+    }
+    /* 1 = XFixesSetSelectionOwnerNotifyMask */
+    p_xfixes_select(g_clip_dpy, g_clip_win, A_CLIPBOARD, 1);
+    XFlush(g_clip_dpy);
+    g_clip_changed = 1;          /* take whatever is already there */
+}
+
+bool plat_clipboard_changed(void) {
+    int v = g_clip_changed;
+    g_clip_changed = 0;
+    return v != 0;
+}
+
+/* Pump our own connection while waiting for an answer.
+ *
+ * Answering SelectionRequest in here is not politeness, it is required: when
+ * we own the clipboard we are asking OURSELVES for the data, and a wait loop
+ * that only watched for the reply would sit there until it timed out, holding
+ * the request it was supposed to answer. */
+static bool clip_pump(int type_wanted, Atom prop_wanted, XEvent* out, int ms) {
+    Display* d = g_clip_dpy;
+    for (int i = 0; i < ms / 5 + 1; i++) {
+        while (XPending(d)) {
+            XEvent ev;
+            XNextEvent(d, &ev);
+            if (ev.type == SelectionRequest &&
+                ev.xselectionrequest.owner == g_clip_win) {
+                clip_answer(&ev.xselectionrequest);
+                continue;
+            }
+            if (g_xfixes_evbase >= 0 && ev.type == g_xfixes_evbase) {
+                g_clip_changed = 1;
+                continue;
+            }
+            if (ev.type == type_wanted) {
+                if (type_wanted == PropertyNotify &&
+                    (ev.xproperty.atom != prop_wanted ||
+                     ev.xproperty.state != PropertyNewValue))
+                    continue;
+                *out = ev;
+                return true;
+            }
+        }
+        plat_sleep_ms(5);
+    }
+    return false;
+}
+
+/* Ask the clipboard owner for one target. Returns malloc'd bytes, or NULL. */
+static uint8_t* clip_fetch(Atom target, size_t* out_len) {
+    Display* d = g_clip_dpy;
+    *out_len = 0;
+    if (!d || !g_clip_win) return NULL;
+
+    XDeleteProperty(d, g_clip_win, A_PROP_IN);
+    XConvertSelection(d, A_CLIPBOARD, target, A_PROP_IN, g_clip_win, CurrentTime);
+    XFlush(d);
+
+    XEvent ev;
+    if (!clip_pump(SelectionNotify, None, &ev, 1500)) return NULL;
+    if (ev.xselection.property == None) return NULL;   /* target not offered */
+
+    Atom type = None; int fmt = 0;
+    unsigned long nitems = 0, rem = 0;
+    unsigned char* dat = NULL;
+
+    /* Peek at the type without consuming, to spot INCR. */
+    if (XGetWindowProperty(d, g_clip_win, A_PROP_IN, 0, 0, False, AnyPropertyType,
+                           &type, &fmt, &nitems, &rem, &dat) != Success)
+        return NULL;
+    if (dat) { XFree(dat); dat = NULL; }
+
+    if (type == A_INCR) {
+        /* Deleting the property is the signal to send the first chunk. Each
+         * further delete asks for the next; a zero-length chunk ends it. */
+        XDeleteProperty(d, g_clip_win, A_PROP_IN);
+        XFlush(d);
+        uint8_t* buf = NULL;
+        size_t   len = 0;
+        for (int chunk = 0; chunk < 4096; chunk++) {
+            if (!clip_pump(PropertyNotify, A_PROP_IN, &ev, 3000)) break;
+            Atom t2 = None; int f2 = 0;
+            unsigned long n2 = 0, r2 = 0;
+            unsigned char* d2 = NULL;
+            if (XGetWindowProperty(d, g_clip_win, A_PROP_IN, 0, 16 * 1024 * 1024,
+                                   True, AnyPropertyType, &t2, &f2, &n2, &r2,
+                                   &d2) != Success)
+                break;
+            size_t got = (f2 == 8) ? (size_t)n2 : 0;
+            if (got == 0) { if (d2) XFree(d2); break; }   /* end of stream */
+            if (len + got > 64u * 1024 * 1024) { XFree(d2); break; }
+            uint8_t* nb = (uint8_t*)realloc(buf, len + got);
+            if (!nb) { XFree(d2); free(buf); return NULL; }
+            buf = nb;
+            memcpy(buf + len, d2, got);
+            len += got;
+            XFree(d2);
+            XFlush(d);
+        }
+        *out_len = len;
+        if (!len) { free(buf); return NULL; }
+        return buf;
+    }
+
+    /* Ordinary, one-shot. Only 8-bit data is wanted here (text and PNG both
+     * are); a 32-bit property would come back as an array of long, which is
+     * eight bytes per item on 64-bit and not what the caller expects. */
+    if (XGetWindowProperty(d, g_clip_win, A_PROP_IN, 0, 16 * 1024 * 1024, True,
+                           AnyPropertyType, &type, &fmt, &nitems, &rem,
+                           &dat) != Success || !dat)
+        return NULL;
+    if (fmt != 8 || nitems == 0) { XFree(dat); return NULL; }
+    uint8_t* out = (uint8_t*)malloc(nitems + 1);
+    if (!out) { XFree(dat); return NULL; }
+    memcpy(out, dat, nitems);
+    out[nitems] = 0;
+    XFree(dat);
+    *out_len = nitems;
+    return out;
+}
+
+/* Did the owner mark this a secret?
+ *
+ * X has no equivalent of Windows' exclusion formats, but KeePassXC's hint has
+ * become the de-facto one and other managers follow it. Honouring it is the
+ * difference between a clipboard history and a password log. */
+static bool clip_owner_forbids_x11(void) {
+    size_t n = 0;
+    uint8_t* v = clip_fetch(A_KDE_PASSWORD, &n);
+    if (!v) return false;
+    bool secret = (n >= 6 && memcmp(v, "secret", 6) == 0);
+    free(v);
+    return secret;
+}
+
+int plat_clipboard_read(char** out_text, uint8_t** out_rgba, int* out_w, int* out_h) {
+    if (out_text) *out_text = NULL;
+    if (out_rgba) *out_rgba = NULL;
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+
+    clip_init();
+    if (!g_clip_dpy || !g_clip_win) return PLAT_CLIP_NONE;
+    if (XGetSelectionOwner(g_clip_dpy, A_CLIPBOARD) == None) return PLAT_CLIP_NONE;
+    if (clip_owner_forbids_x11()) return PLAT_CLIP_NONE;
+
+    /* Pictures first: an image on the clipboard usually also offers a text
+     * target (a filename, or the page it came from), and taking that instead
+     * would quietly turn every copied picture into a scrap of text. */
+    size_t n = 0;
+    uint8_t* png = clip_fetch(A_PNG, &n);
+    if (png) {
+        int w = 0, h = 0, ch = 0;
+        uint8_t* rgba = stbi_load_from_memory(png, (int)n, &w, &h, &ch, 4);
+        free(png);
+        if (rgba && w > 0 && h > 0) {
+            if (out_rgba) *out_rgba = rgba; else free(rgba);
+            if (out_w) *out_w = w;
+            if (out_h) *out_h = h;
+            return PLAT_CLIP_IMAGE;
+        }
+        free(rgba);
+    }
+
+    uint8_t* txt = clip_fetch(A_UTF8, &n);
+    if (!txt) txt = clip_fetch(A_STRING, &n);
+    if (txt) {
+        if (n > 1024 * 1024) { free(txt); return PLAT_CLIP_NONE; }
+        if (out_text) *out_text = (char*)txt; else free(txt);
+        return PLAT_CLIP_TEXT;
+    }
+    return PLAT_CLIP_NONE;
+}
+
+/* ---- a plain list popup ----------------------------------------------- */
+int plat_show_list_menu(struct GLFWwindow* w, const char* const* items, int n,
+                        const char* title) {
+    (void)w;
+    Display* d = dpy();
+    if (!d || n <= 0) return -1;
+    MenuRow rows[MENU_MAX];
+    int r = 0;
+    if (title && *title) {
+        r = menu_head(rows, r, title);
+        r = menu_sep(rows, r);
+    }
+    for (int i = 0; i < n && r < MENU_MAX; i++)
+        r = menu_add(rows, r, i + 1, "%s", items[i] ? items[i] : "");
+    int chosen = menu_run(d, rows, r);
+    return chosen > 0 ? chosen - 1 : -1;
 }
 
 /* ---- 2D fallback painting ---------------------------------------------
