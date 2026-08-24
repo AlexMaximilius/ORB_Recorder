@@ -99,13 +99,12 @@ law: a body sweeps equal areas in equal times, so its angular rate goes as
 the shipped integer code: **4.8× faster at periapsis where theory says 5.0×**,
 with the swept area differing 4% between the extremes.
 
-### Still base 60 — twice
+### No trigonometry, no floating point
 
-A real orbit needs finer steps than sixty. Rather than carry a bigger table,
-each sixtieth is subdivided into sixty again — **3600 to the turn** — and the
-value interpolated between neighbouring entries. Sine is near-linear over six
-degrees, so the error is about one part in seven hundred: a fifth of a pixel
-at this radius. Still a lookup, still no trigonometry, still no floating point.
+A real orbit needs a finer angular grid than the coarse table alone provides,
+so values between entries are interpolated. Sine is near-linear over a small
+step, so the error works out around one part in seven hundred — a fifth of a
+pixel at this radius. It stays a lookup: no trig calls, no floats.
 
 ### Two bugs worth naming
 
@@ -187,8 +186,7 @@ multiplied by alpha a second time.
 A circle seen at an angle is an ellipse, so a tilted orbit is the unit circle
 squashed along one axis and then turned. Both the squash and the turn drift, at
 periods of 47 and 29 frames — deliberately not multiples of one another, so the
-moon never retraces the same ellipse. Still base 60, still no floating point in
-the motion.
+moon never retraces the same ellipse. Still no floating point in the motion.
 
 Depth shows as size and brightness rather than occlusion, because the moon is
 **forbidden to cross in front of the orb**: *"the main planet right click drag
@@ -262,12 +260,11 @@ imminent.
 
 Click the moon and it tells you what it can see.
 
-### It orbits in base 60
+### It orbits on integers
 
-Sixty positions around the circle, an integer sine table, no trigonometry and
-no floating point anywhere in its motion — positions are half-pixels, the same
-fixed point the annotation editor uses. An orbit is a lookup, not a
-calculation.
+An integer sine table, no trigonometry and no floating point anywhere in its
+motion — positions are half-pixels, the same fixed point the annotation editor
+uses. An orbit is a lookup, not a calculation.
 
 Two things that were not obvious:
 
