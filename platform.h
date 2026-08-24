@@ -67,9 +67,17 @@ void plat_window_set_circular    (struct GLFWwindow* w, int diameter);
  * centre -- it maps straight onto CreateEllipticRgn(bx, by, bx+d, by+d).
  * Named cx/cy originally, which read as "centre" and cost a regression on
  * 2026-08-14 when the window stopped being a fixed multiple of the orb. */
+/* The window's visible AND clickable area: the orb circle, optionally a bar
+ * for the toast, and optionally a second circle for the moon.
+ *
+ * The moon is why this takes a second circle at all. A window is clipped to
+ * its region, so anything drawn outside it is simply not there -- the moon
+ * was invisible until the region followed it. (mx, my) is the TOP-LEFT of the
+ * moon's bounding box, not its centre; md <= 0 means no moon. */
 void plat_window_set_shape (struct GLFWwindow* w,
                             int bx, int by, int diameter,
-                            int rx, int ry, int rw, int rh);
+                            int rx, int ry, int rw, int rh,
+                            int mx, int my, int md);
 void plat_window_set_clickthrough(struct GLFWwindow* w, bool on);
 
 /* ---- 2D fallback -------------------------------------------------------
@@ -130,6 +138,18 @@ uint8_t* plat_capture_window (void* native_handle,
  * orb on, so the choice survives resolution changes and renumbering. */
 typedef struct { int x, y, w, h; char name[64]; char id[64]; } PlatMonitor;
 int      plat_enum_monitors (PlatMonitor* out, int max);
+/* Draw the mouse pointer into captures.
+ *
+ * Screen capture does NOT include the cursor -- the compositor draws it on
+ * top of everything afterwards, so it is not in any window's pixels. It has
+ * to be fetched and composited in by hand.
+ *
+ * Joe filmed the orb's moon chasing his mouse and the result was baffling:
+ * the moon lunges around an empty screen, because the thing it is chasing is
+ * invisible. A recording of an interaction is not a recording of anything
+ * unless you can see the pointer. */
+void plat_capture_draw_cursor(bool on);
+
 uint8_t* plat_capture_rect  (int x, int y, int w, int h,
                              int capW, int capH);
 
@@ -175,6 +195,11 @@ enum {
     PLAT_MENU_CLIPHIST_BASE   = 160,   /* +0 off, +1..+3 = keep 5/10/20    */
 #define PLAT_CLIPHIST_CHOICES 4
     PLAT_MENU_CLIPHIST_LAST   = 163,
+    PLAT_MENU_TOGGLE_MOON     = 164,   /* the little satellite            */
+    PLAT_MENU_FILM_GIF        = 165,   /* ghost-record the orb -> GIF     */
+    PLAT_MENU_FILM_MP4        = 166,   /* ghost-record the orb -> MP4     */
+    PLAT_MENU_FILM_STOP       = 167,
+    PLAT_MENU_TOGGLE_CURSOR   = 168,   /* record the mouse pointer        */
     PLAT_MENU_MONITOR_BASE    = 200,   /* GIF:   + monitor index */
     PLAT_MENU_VMONITOR_BASE   = 300,   /* VIDEO: + monitor index */
     PLAT_MENU_CAMERA_BASE     = 400    /* CAMERA: + device index */
@@ -193,6 +218,9 @@ typedef struct {
     bool dbl_video;      /* double-click arms MP4 rather than GIF */
     bool run_at_startup; /* reflects the OS, not a stored preference */
     int  clip_keep;      /* clipboard entries remembered; 0 = feature off */
+    bool moon_on;        /* the moon circling the orb */
+    bool ghost_on;       /* a ghost recorder is filming right now */
+    bool draw_cursor;    /* draw the mouse pointer into recordings */
 } PlatMenuState;
 
 int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
@@ -220,6 +248,41 @@ int plat_list_sibling_images(const char* path, char** out, int max, int* out_sel
  * registry rather than hardcoded, so HEIC, AVIF and camera RAW come along
  * for free wherever the user has those decoders. Returns the count. */
 int plat_list_image_extensions(char* out, size_t sz);
+
+/* ---- how hard is this machine straining? ------------------------------
+ *
+ * This is C0ry_AI's measure, brought local. C0ry -- the Core Memory
+ * Controller on ai-ubuntu -- watches Linux PSI: the share of time tasks spent
+ * STALLED waiting for a resource. That is the honest reading, and it is not
+ * the same as utilisation: a machine at 100% CPU with nothing waiting is
+ * working, while one at 40% with everything waiting is suffering. Utilisation
+ * says how busy; pressure says who is hurting.
+ *
+ * Values are TENTHS OF A PERCENT as integers -- PSI reports two decimals and
+ * we are not about to introduce a float for it. -1 means "not measurable
+ * here".
+ *
+ * `true_stall` is the honesty flag. Linux fills these from /proc/pressure and
+ * they are real stall figures. Windows has no PSI, so it reports the closest
+ * things it does know -- memory load and CPU busy -- and sets this false so
+ * nothing claims to be measuring what it is not. */
+typedef struct {
+    int  mem;          /* tenths of a percent, or -1 */
+    int  cpu;
+    int  io;
+    bool true_stall;   /* these are genuine stall figures, not utilisation */
+
+    /* Disk. Not pressure in PSI's sense -- nothing stalls because a disk is
+     * full, it just stops. But running out of room is the failure this
+     * machine actually keeps having, and a warning that arrives while there
+     * is still time to act is worth more than a precise one that arrives
+     * after. */
+    int  disk_used;    /* tenths of a percent of the system drive, or -1 */
+    int  disk_free_mb; /* what is left */
+    int  disk_total_mb;
+} PlatPressure;
+
+void plat_pressure(PlatPressure* out);
 
 /* ---- reveal a file in the OS file explorer ---------------------------- */
 void plat_open_folder_select(const char* file_path);
@@ -356,7 +419,28 @@ int plat_show_list_menu(struct GLFWwindow* w, const char* const* items, int n,
  * capture key dead and a menu full of unchecked boxes, which looks like a
  * broken install rather than a duplicate. Returns false if another
  * instance already holds the lock. */
-bool plat_single_instance(void);
+/* Only one copy at a time -- per TAG. The main orb and the ghost recorder
+ * take different tags, because the reason for the lock (two copies fighting
+ * over the global hotkeys) does not apply to a process that never asks for
+ * a hotkey. */
+bool plat_single_instance(const char* tag);
+
+/* Start another copy of this same executable with these arguments.
+ *
+ * This exists for the ghost recorder. An orb that records ITSELF turns red
+ * and pulses while it does it, so the one state you can never film is the orb
+ * at rest -- or armed, or playing tag with the moon. A second, invisible copy
+ * films the first, and because it has no idea the orb is special, it captures
+ * it like any other window.
+ *
+ * `args` must not contain quoted paths: it is split on spaces. */
+bool plat_spawn_self(const char* args);
+
+/* Scratch directory for state the two copies use to find each other.
+ * On Linux this is XDG_RUNTIME_DIR when set, which is tmpfs -- genuinely in
+ * RAM. On Windows it is %TEMP%, which is not; the isolation is the same
+ * either way, the residency is not. Ends with a separator. */
+void plat_temp_dir(char* out, size_t sz);
 
 /* Show or hide the orb window itself. Hiding is not minimising: there is no
  * taskbar button to restore from, so the tray icon is the way back. */

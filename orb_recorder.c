@@ -171,6 +171,8 @@ typedef struct {
     int  audio_src;               /* PLAT_AUDIO_* for video recording */
     bool dbl_video;               /* double-click arms MP4 rather than GIF */
     int  clip_keep;               /* clipboard entries remembered; 0 = off */
+    bool moon_on;                 /* the little satellite -- C0ry */
+    bool draw_cursor;             /* draw the mouse pointer into captures */
     bool armed_video;             /* the pick in flight is MP4 */
     int  armed_mode;              /* ARM_* -- what the pick will do */
 
@@ -297,6 +299,54 @@ static bool g_no3d = false;
  * icon must exist before the orb can disappear, or there is no way back. */
 static bool g_orb_hidden = false;
 
+/* ── the ghost recorder ────────────────────────────────────────────────
+ *
+ * Joe: *"we make a venv in ram launch a hidden orb to record the orb or any
+ * window (that refuses to know the orb) hahaha"* -- and the joke is the
+ * design. The recorder knows about the orb and leaves it out of its own
+ * captures; a second copy that REFUSES TO KNOW THE ORB films it like any
+ * other window, with no special case at all.
+ *
+ * The problem it solves is not that self-recording fails. It works. It is
+ * that an orb recording itself goes RED and pulses while it does it, so the
+ * one thing you can never film is the orb at rest -- or armed, or idling, or
+ * playing tag with its moon. The visible orb has to be a bystander.
+ *
+ * The ghost has no orb, takes no hotkeys, and writes no settings. That last
+ * one matters most: two copies sharing settings.ini would have the ghost's
+ * defaults overwrite wherever you had parked the orb.
+ *
+ * The two find each other through two files in the temp directory -- which on
+ * Linux is XDG_RUNTIME_DIR, and so is genuinely in RAM. On Windows it is
+ * %TEMP%, and is not.
+ */
+static bool        g_ghost = false;         /* this process IS the ghost */
+static PlatMonitor g_ghost_rect;
+static bool        g_ghost_video = false;
+static int         g_ghost_secs  = 180;
+static uint64_t    g_ghost_began = 0;
+
+static void ghost_paths(char* stop, size_t sn, char* run, size_t rn) {
+    char tmp[400];
+    plat_temp_dir(tmp, sizeof tmp);
+    if (stop) snprintf(stop, sn, "%sorb_ghost.stop", tmp);
+    if (run)  snprintf(run,  rn, "%sorb_ghost.run",  tmp);
+}
+
+static bool file_exists(const char* p) {
+    FILE* f = fopen(p, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+/* Is a ghost filming right now? Asked by the MAIN copy, to label its menu. */
+static bool ghost_is_running(void) {
+    char run[512];
+    ghost_paths(NULL, 0, run, sizeof run);
+    return file_exists(run);
+}
+
 /* Delayed whole-screen capture.
  *
  * The only way to photograph a menu. Windows menus are modal and close on any
@@ -317,6 +367,14 @@ static char  g_log_path[512];
 
 static void log_open(void) {
     plat_get_log_path(g_log_path, sizeof g_log_path);
+    /* Its own file. Two processes appending to one log interleave into
+     * something neither of them can be debugged from. */
+    if (g_ghost) {
+        size_t n = strlen(g_log_path);
+        if (n > 4 && n + 7 < sizeof g_log_path)
+            snprintf(g_log_path + n - 4, sizeof g_log_path - (n - 4),
+                     "_ghost.txt");
+    }
     /* Rotate at 1 MB */
     FILE* peek = fopen(g_log_path, "rb");
     if (peek) {
@@ -377,6 +435,11 @@ static char g_cfg_path[512];
 extern const char* HK_NAMES[PLAT_HK_COUNT];
 
 static void settings_save(void) {
+    /* The ghost is a guest in the main copy's configuration. It reads the
+     * output folder and the frame rate and then keeps its hands off: writing
+     * here would move the real orb, resize it, and undo whichever toggles the
+     * ghost happens not to have. */
+    if (g_ghost) return;
     if (!g_cfg_path[0]) plat_get_config_path(g_cfg_path, sizeof g_cfg_path);
     FILE* f = fopen(g_cfg_path, "w");
     if (!f) { log_write("cfg", "could not write %s", g_cfg_path); return; }
@@ -410,6 +473,8 @@ static void settings_save(void) {
     fprintf(f, "dbl_video=%d\n", g.dbl_video ? 1 : 0);
     /* The COUNT is remembered; the entries themselves never are. */
     fprintf(f, "clip_keep=%d\n", g.clip_keep);
+    fprintf(f, "moon=%d\n", g.moon_on ? 1 : 0);
+    fprintf(f, "draw_cursor=%d\n", g.draw_cursor ? 1 : 0);
     fclose(f);
     g.settings_dirty = false;
     log_write("cfg", "saved orb=(%d,%d) editor=(%d,%d %dx%d)",
@@ -486,6 +551,8 @@ static void settings_load(void) {
         else if (!strcmp(key, "tray_only")) { g.tray_only = val != 0; }
         else if (!strcmp(key, "orb_hidden")) { g_orb_hidden = val != 0; }
         else if (!strcmp(key, "dbl_video")) { g.dbl_video = val != 0; }
+        else if (!strcmp(key, "moon")) { g.moon_on = val != 0; }
+        else if (!strcmp(key, "draw_cursor")) { g.draw_cursor = val != 0; }
         else if (!strcmp(key, "clip_keep")) {
             g.clip_keep = (val < 0) ? 0 : (val > CLIP_MAX ? CLIP_MAX : val);
         }
@@ -641,11 +708,18 @@ static bool toast_rect(int win_w, int win_h,
     return (*rw > 0 && *rh > 0);
 }
 
+/* The moon is defined further down -- it needs popup() and ORB_VIS_RADIUS,
+ * which are not in scope yet -- but the window region up here has to know
+ * where it is, because a window is clipped to its region and the moon would
+ * otherwise be invisible. */
+static void moon_region_rect(int* bx, int* by, int* d);
+static bool moon_region_dirty(void);   /* moved since the last rebuild? clears */
+
 /* Region: at rest the orb circle, plus the toast bar when one is showing --
  * the toast is drawn above the orb and would otherwise be clipped off. A
  * ping opens the region to the whole window so the rings can paint. */
 static void orb_apply_region(bool wide) {
-    if (wide) { plat_window_set_shape(g.window, 0, 0, 0, 0, 0, 0, 0); return; }
+    if (wide) { plat_window_set_shape(g.window, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); return; }
     int win = ORB_WIN_SIZE;
     int rx = 0, ry = 0, rw = 0, rh = 0;
     toast_rect(win, win, &rx, &ry, &rw, &rh, NULL);
@@ -654,8 +728,10 @@ static void orb_apply_region(bool wide) {
      * centre offsets the region by half the orb, which clips half of it away
      * and puts the clickable area where the orb is not. */
     int inset = (win - g.orb_size) / 2;
+    int mx = 0, my = 0, md = 0;
+    if (g.moon_on) moon_region_rect(&mx, &my, &md);
     plat_window_set_shape(g.window, inset, inset, g.orb_size,
-                          rx, ry, rw, rh);
+                          rx, ry, rw, rh, mx, my, md);
 }
 
 /* Re-shape when a toast appears, expires, OR CHANGES TEXT.
@@ -672,7 +748,10 @@ static void toast_region_tick(void) {
     char now_txt[40];
     snprintf(now_txt, sizeof now_txt, "%s|%s",
              showing ? g.popupLabel : "", showing ? g.popupShort : "");
-    if (strcmp(now_txt, last) == 0) return;
+    /* Rebuild when the toast changed OR the moon moved. Asking clears the
+     * moon's flag, so this must not short-circuit past it. */
+    bool moved = moon_region_dirty();
+    if (strcmp(now_txt, last) == 0 && !moved) return;
     snprintf(last, sizeof last, "%s", now_txt);
     orb_apply_region(false);
 }
@@ -964,6 +1043,11 @@ const char* HK_NAMES[PLAT_HK_COUNT] = { "F5", "F6", "F7", "F8", "F9",
 
 static bool apply_hotkey(int i, bool want) {
     if (i < 0 || i >= PLAT_HK_COUNT) return false;
+    /* The ghost never takes a hotkey. This is the whole reason a second copy
+     * is allowed to exist at all: the single-instance lock is there because
+     * two copies would fight over F4..F9, and a process that never asks
+     * cannot fight. */
+    if (g_ghost) { g.hotkey_on[i] = false; return false; }
     if (want) {
         bool got = plat_register_hotkey(HK_IDS[i]);
         g.hotkey_on[i] = got;
@@ -1125,7 +1209,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.18",
+    "ORB_RECORDER  v3.20",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1156,6 +1240,15 @@ static const char* HELP_LINES[] = {
     "                  ARMS GIF OR MP4 -- SET IN THE MENU",
     "  RIGHT-CLICK     MENU. HOTKEYS SUBMENU RELEASES ANY",
     "                  KEY BACK TO OTHER APPLICATIONS.",
+    "",
+    "  RECORD MOUSE       RIGHT-CLICK MENU. ON BY DEFAULT.",
+    "",
+    "THE MOON",
+    "  A SMALL SATELLITE CIRCLES THE ORB. BRING THE",
+    "  CURSOR NEAR AND IT COMES TO MEET YOU.",
+    "  CLICK IT           WHAT THE MACHINE IS DOING",
+    "  IT IS C0RY -- THE CORE MEMORY CONTROLLER.",
+    "  TURN IT OFF IN THE RIGHT-CLICK MENU.",
     "",
     "CLIPBOARD HISTORY",
     "  MIDDLE-CLICK    THE LAST FEW THINGS YOU COPIED.",
@@ -1654,6 +1747,576 @@ static void state_color(float* r, float* gc, float* b) {
     *r = 1.00f; *gc = 0.55f; *b = 0.10f;                       /* idle */
 }
 
+
+/* ── the moon ──────────────────────────────────────────────────────────
+ *
+ * A small satellite that circles the orb and drifts towards your cursor when
+ * you come near it. Joe: *"the orb has a moon that follows your cursor once
+ * your mouse gets close to it, the moon is the AI."*
+ *
+ * So the moon is not decoration -- it is the AI's presence on the desktop,
+ * and later it carries C0ry's reading of how hard this machine is straining.
+ *
+ * IT ORBITS IN BASE 60. Sixty positions around the circle, an integer sine
+ * table, no trigonometry and no floating point anywhere in its motion --
+ * positions are half-pixels, the way paint.h does it. That is the house rule
+ * and it also happens to be simpler: an orbit is a lookup, not a calculation.
+ *
+ * The one thing that is not obvious: a window is CLIPPED TO ITS REGION, so
+ * drawing the moon outside the orb's circle showed nothing at all until the
+ * region learned to follow it. The region is also the clickable area, which
+ * is why the moon can be clicked at all.
+ */
+#define MOON_STEPS   60                  /* base 60: the orbit IS the table */
+#define MOON_HP      2                   /* half-pixel fixed point */
+
+/* Frames per sixtieth of a turn. Set by eye, not by arithmetic: at 3 the moon
+ * lapped the orb every four seconds, which does not read as an orbit -- it
+ * reads as something spinning, or broken. A lap takes about thirteen seconds
+ * now, slow enough that you notice it HAS moved rather than watching it move,
+ * which is what a moon does. */
+#define MOON_FRAMES_PER_STEP 10
+
+static const short MOON_SIN[MOON_STEPS] = {
+        0,   105,   208,   309,   407,   500,   588,   669,   743,   809,
+      866,   914,   951,   978,   995,  1000,   995,   978,   951,   914,
+      866,   809,   743,   669,   588,   500,   407,   309,   208,   105,
+        0,  -105,  -208,  -309,  -407,  -500,  -588,  -669,  -743,  -809,
+     -866,  -914,  -951,  -978,  -995, -1000,  -995,  -978,  -951,  -914,
+     -866,  -809,  -743,  -669,  -588,  -500,  -407,  -309,  -208,  -105,
+};
+static int moon_sin(int step) { return MOON_SIN[((step % MOON_STEPS) + MOON_STEPS) % MOON_STEPS]; }
+static int moon_cos(int step) { return moon_sin(step + MOON_STEPS / 4); }
+
+static struct {
+    int  x, y;        /* half-pixels from the window centre */
+    int  step;        /* orbit position, 0..59 */
+    int  sub;         /* fractional advance of `step`, in sixtieths */
+    int  inc,  inc_sub;    /* how edge-on the orbit is */
+    int  node, node_sub;   /* which way it is tilted */
+    int  depth;            /* +1000 nearest, -1000 furthest -- for size/light */
+    bool following;   /* the cursor is near enough that we are chasing it */
+    int  last_rx, last_ry;   /* position the window region was last built for */
+    bool region_stale;
+} g_moon = { 0, 0, 0, 0, 0, 0, 0, 0, 0, false, -9999, -9999, true };
+
+/* Everything about the moon's size derives from the orb's, so it stays a
+ * moon when the orb is scrolled from 36 px to 240. ORB_VIS_RADIUS is the
+ * radius the sphere actually paints at, which is much less than the viewport
+ * it is drawn into -- using the viewport would put the moon miles away. */
+static int moon_radius(void)   { int r = ORB_VIS_RADIUS / 3; return r < 4 ? 4 : r; }
+static int moon_orbit_r(void)  { return ORB_VIS_RADIUS * 2 + moon_radius(); }
+
+/* The orb must always be clickable.
+ *
+ * Joe: *"we need to have it never cover the main planet when you want to
+ * click on it."* So this is a hard floor, not a tendency: the moon's centre
+ * is never allowed nearer than the orb's edge plus its own radius plus a
+ * little air, whatever the orbit or the cursor is doing. Enforced in one
+ * place, on the TARGET, so every path -- orbiting, chasing, tilted edge-on --
+ * inherits it. */
+static int moon_min_r(void) {
+    /* Worst case, not resting case. Two things make the gap smaller than it
+     * looks on paper, and the first version of this counted neither -- Joe
+     * filmed the moon clipping into the cage:
+     *
+     *   the orb PULSES to 1.10x while recording (draw_orb's scalePulse), and
+     *   the moon SWELLS to 1.25x on the near side of its orbit (draw_moon's
+     *   depth term).
+     *
+     * ORB_VIS_RADIUS is the cage, not the core sphere, so it is the right
+     * thing to clear -- just not at its resting size. */
+    return (ORB_VIS_RADIUS * 11) / 10 + (moon_radius() * 5) / 4 + 6;
+}
+static int moon_notice_r(void) { return ORB_VIS_RADIUS * 5; }
+/* Kept inside the window: past this it would be clipped away by the frame. */
+static int moon_leash(void)    { return ORB_WIN_SIZE / 2 - moon_radius() - 6; }
+
+static int moon_isqrt(int v) {
+    if (v <= 0) return 0;
+    int r = 0;
+    for (int b = 1 << 15; b; b >>= 1) {
+        int t = r + b;
+        if (t <= 46340 && t * t <= v) r = t;
+    }
+    return r;
+}
+
+/* Where the moon sits at orbit position `step`, in half-pixels, for the
+ * orbit's current orientation.
+ *
+ * A circle seen at an angle is an ellipse, so a tilted orbit is the unit
+ * circle SQUASHED along one axis and then turned. `inc` squashes, `node`
+ * turns. Both drift, at rates that do not divide into each other, so the moon
+ * never retraces the same ellipse twice -- which is what makes it look like
+ * it is going round something rather than round a drawing of something.
+ *
+ * *depth is how near the moon is: +1000 at the front of the orbit, -1000 at
+ * the back. Nothing is occluded (the floor above sees to that), so depth is
+ * spent on size and brightness instead, which is what sells it as 3D. */
+static void moon_orbit_pos(int step, int* ox, int* oy, int* depth) {
+    /* Squash factor, 620..1000. Never fully edge-on: at zero the moon would
+     * slide along a straight line through the orb, which reads as a glitch. */
+    int flat = 810 + 190 * moon_cos(g_moon.inc) / 1000;
+
+    int c  = moon_cos(step);                  /* x1000 */
+    int sf = moon_sin(step) * flat / 1000;    /* x1000, squashed */
+
+    int nc = moon_cos(g_moon.node), ns = moon_sin(g_moon.node);
+    int ex = (c * nc - sf * ns) / 1000;
+    int ey = (c * ns + sf * nc) / 1000;
+
+    int r = moon_orbit_r() * MOON_HP;
+    *ox = r * ex / 1000;
+    *oy = r * ey / 1000;
+    /* What the squash took out of the plane is what came towards you. */
+    if (depth) *depth = moon_sin(step) * (1000 - flat) / 1000 * 1000 / 380;
+}
+
+static void moon_region_rect(int* bx, int* by, int* d) {
+    /* The largest the moon can be drawn, not its resting size: the region is
+     * a hard clip, and a near-side moon swollen by depth would have its edge
+     * sliced off by a region built for the smaller one. */
+    int r = moon_radius() * 1250 / 1000 + 1;
+    *d  = r * 2;
+    *bx = ORB_WIN_SIZE / 2 + g_moon.x / MOON_HP - r;
+    *by = ORB_WIN_SIZE / 2 + g_moon.y / MOON_HP - r;
+}
+
+static bool moon_region_dirty(void) {
+    bool d = g_moon.region_stale;
+    g_moon.region_stale = false;
+    return d;
+}
+
+static void moon_pressure_tick(void);   /* defined with the colour, below */
+
+/* One step of motion. Integer throughout. */
+static void moon_tick(void) {
+    if (!g.moon_on) return;
+    moon_pressure_tick();
+
+    /* Where the cursor is, relative to the orb's centre. */
+    int wx = 0, wy = 0;
+    glfwGetWindowPos(g.window, &wx, &wy);
+    int ccx = wx + ORB_WIN_SIZE / 2, ccy = wy + ORB_WIN_SIZE / 2;
+    int cx = 0, cy = 0;
+    plat_get_cursor(&cx, &cy);
+    int dx = cx - ccx, dy = cy - ccy;
+
+    /* The plane drifts continuously -- including while the moon is chasing
+     * the cursor -- so it rejoins a slightly different orbit than the one it
+     * left. Two different periods, neither a multiple of the other, which is
+     * what keeps the whole thing from looking like a loop. */
+    if (++g_moon.inc_sub  >= 47) { g_moon.inc_sub  = 0; g_moon.inc  = (g_moon.inc  + 1) % MOON_STEPS; }
+    if (++g_moon.node_sub >= 29) { g_moon.node_sub = 0; g_moon.node = (g_moon.node + 1) % MOON_STEPS; }
+
+    /* Near enough to notice? Compared squared, so no square root. */
+    int nr = moon_notice_r();
+    g_moon.following = (dx * dx + dy * dy) < nr * nr;
+
+    int tx, ty;
+    if (g_moon.following) {
+        /* Chase the cursor, but stay on the leash. */
+        int lx = dx * MOON_HP, ly = dy * MOON_HP;
+        int leash = moon_leash() * MOON_HP;
+        int d2 = lx * lx + ly * ly;
+        if (d2 > leash * leash && d2 > 0) {
+            int len = moon_isqrt(d2);
+            if (len > 0) { lx = lx * leash / len; ly = ly * leash / len; }
+        }
+        tx = lx; ty = ly;
+        /* Chasing gives no depth cue of its own; ease back to face-on rather
+         * than freezing whatever the orbit last handed us. */
+        g_moon.depth -= g_moon.depth / 8;
+    } else {
+        /* Idle: go round. One sixtieth of a turn every ten frames, so a lap
+         * takes about ten seconds.
+         *
+         * The first version took three, which does not read as an orbit at
+         * all -- it reads as something spinning, and it pulls the eye
+         * constantly. A moon should be somewhere slightly different when you
+         * next glance at it, not visibly moving while you work. */
+        g_moon.sub += 1;
+        if (g_moon.sub >= MOON_FRAMES_PER_STEP) {
+            g_moon.sub = 0;
+            g_moon.step = (g_moon.step + 1) % MOON_STEPS;
+        }
+        moon_orbit_pos(g_moon.step, &tx, &ty, &g_moon.depth);
+    }
+
+    /* Never on top of the orb. Push the TARGET out to the floor rather than
+     * the position, so the moon slides round the edge instead of stopping
+     * dead against it -- and so that pointing AT the orb makes the moon step
+     * politely aside, which is the moment this rule exists for. */
+    {
+        int minr = moon_min_r() * MOON_HP;
+        int d2 = tx * tx + ty * ty;
+        if (d2 < minr * minr) {
+            int len = moon_isqrt(d2);
+            if (len < 1) {
+                /* Dead centre: no direction to push along, so use the orbit's. */
+                int ox, oy;
+                moon_orbit_pos(g_moon.step, &ox, &oy, NULL);
+                tx = ox; ty = oy;
+                len = moon_isqrt(tx * tx + ty * ty);
+            }
+            if (len > 0) { tx = tx * minr / len; ty = ty * minr / len; }
+        }
+    }
+
+    /* Ease, never jump. A sixth of the remaining distance per frame is fast
+     * enough to feel attentive and slow enough to look like mass. */
+    g_moon.x += (tx - g_moon.x) / 6;
+    g_moon.y += (ty - g_moon.y) / 6;
+
+    /* Coming out of a chase, pick the orbit slot the moon is nearest to, so
+     * it rejoins its orbit from where it is instead of sliding back. */
+    if (!g_moon.following) {
+        int best = g_moon.step, bestd = 1 << 30;
+        int r = moon_orbit_r() * MOON_HP;
+        for (int i = 0; i < MOON_STEPS; i++) {
+            int ox, oy;
+            moon_orbit_pos(i, &ox, &oy, NULL);
+            int ex = ox - g_moon.x, ey = oy - g_moon.y;
+            int e = ex * ex + ey * ey;
+            if (e < bestd) { bestd = e; best = i; }
+        }
+        if (bestd > (r / 3) * (r / 3)) g_moon.step = best;
+    }
+
+    /* The region only has to be rebuilt when the moon has actually moved a
+     * pixel or two. Rebuilding every frame means a fresh full-window mask
+     * pixmap on X11 sixty times a second, for movement nobody can see. */
+    int px = g_moon.x / MOON_HP, py = g_moon.y / MOON_HP;
+    if (abs(px - g_moon.last_rx) >= 2 || abs(py - g_moon.last_ry) >= 2) {
+        g_moon.last_rx = px;
+        g_moon.last_ry = py;
+        g_moon.region_stale = true;
+    }
+}
+
+/* Is the pointer on the moon? Window coordinates. */
+static bool moon_hit(double mx, double my) {
+    if (!g.moon_on) return false;
+    int r = moon_radius() + 2;
+    double dx = mx - (ORB_WIN_SIZE / 2 + (double)(g_moon.x / MOON_HP));
+    double dy = my - (ORB_WIN_SIZE / 2 + (double)(g_moon.y / MOON_HP));
+    return (dx * dx + dy * dy) <= (double)(r * r);
+}
+
+/* The moon's colour.
+ *
+ * It is a placeholder for one reading only: how hard this machine is
+ * straining. C0ry_AI -- the Core Memory Controller on ai-ubuntu -- measures
+ * that as PSI pressure, the share of time tasks spent STALLED waiting for
+ * memory, CPU or IO. That is the honest measure: a box at 100% CPU with
+ * nothing waiting is working, a box at 40% with everything stalled is
+ * suffering.
+ *
+ * Until that is wired up it sits at rest: a pale cyan, which is the colour of
+ * a machine with nothing waiting on it. */
+/* Refreshed on a timer, not per frame: reading /proc or asking Windows for
+ * system times sixty times a second would make the moon itself the load. */
+static PlatPressure g_press = { -1, -1, -1, false, -1, 0, 0 };
+static int          g_press_worst = 0;      /* tenths of a percent */
+
+/* How fast the disk is going, in MB per hour.
+ *
+ * The level alone is the wrong alarm. A drive sitting at 80% full has been
+ * fine for months; a drive that has dropped 30 GB since this morning is on
+ * its way to zero whatever it currently reads, and THAT is the failure this
+ * machine keeps having. So the moon watches the slope as well as the level.
+ *
+ * One sample a minute against a mark taken an hour ago -- long enough that a
+ * single build or a video export does not look like a leak. */
+static int      g_disk_mark_mb = -1;
+static uint64_t g_disk_mark_ms = 0;
+static int      g_disk_rate_mbh = 0;        /* negative = losing room */
+
+static void disk_trend_tick(void) {
+    if (g_press.disk_free_mb <= 0) return;
+    uint64_t now = plat_now_ms();
+    if (g_disk_mark_mb < 0) {
+        g_disk_mark_mb = g_press.disk_free_mb;
+        g_disk_mark_ms = now;
+        return;
+    }
+    uint64_t span = now - g_disk_mark_ms;
+    if (span < 60ULL * 1000ULL) return;             /* need a real interval */
+    int delta = g_press.disk_free_mb - g_disk_mark_mb;
+    g_disk_rate_mbh = (int)((int64_t)delta * 3600000LL / (int64_t)span);
+    if (span >= 3600ULL * 1000ULL) {                /* roll the mark hourly */
+        g_disk_mark_mb = g_press.disk_free_mb;
+        g_disk_mark_ms = now;
+    }
+}
+
+/* Disk worry, 0..1000, folded in with the rest.
+ *
+ * Two ways to be worried, and the worse one wins: nearly full, or emptying
+ * fast. 1 GB/hour is the threshold for "fast" because that is 24 GB a day --
+ * about the rate that started this whole conversation. */
+static int disk_worry(void) {
+    int w = 0;
+    if (g_press.disk_used >= 0) {
+        /* Nothing below 85% full; flat out at 97%. */
+        if (g_press.disk_used > 850)
+            w = (g_press.disk_used - 850) * 1000 / 120;
+    }
+    if (g_disk_rate_mbh < 0) {
+        int losing = -g_disk_rate_mbh;              /* MB per hour */
+        int r = losing * 1000 / 2048;               /* 2 GB/h = flat out */
+        /* Only if there is a real amount left to lose -- a small drive that
+         * is stable and nearly full is a different problem. */
+        if (r > w) w = r;
+    }
+    if (w > 1000) w = 1000;
+    return w;
+}
+
+static void moon_pressure_tick(void) {
+    static uint64_t next = 0;
+    uint64_t now = plat_now_ms();
+    if (now < next) return;
+    next = now + 2000;
+    plat_pressure(&g_press);
+    int worst = 0;
+    if (g_press.true_stall) {
+        /* Real stall figures: any of them being high means something is
+         * genuinely waiting, so take the worst. */
+        if (g_press.mem > worst) worst = g_press.mem;
+        if (g_press.cpu > worst) worst = g_press.cpu;
+        if (g_press.io  > worst) worst = g_press.io;
+    } else {
+        /* Utilisation, not pressure. MEMORY FULLNESS IS NOT STRAIN -- a
+         * machine sitting at 65% RAM is perfectly happy, and colouring the
+         * moon by it made it look alarmed on an idle desktop. Unused memory
+         * is wasted memory; that is what it is FOR.
+         *
+         * So CPU busy carries the colour, and memory only starts to count
+         * past 90%, where running out actually is imminent. */
+        if (g_press.cpu > worst) worst = g_press.cpu;
+        if (g_press.mem >= 900) {
+            int m = (g_press.mem - 900) * 10;    /* 90%->0, 100%->full */
+            if (m > worst) worst = m;
+        }
+    }
+    /* The disk speaks on the same scale as everything else. It is scaled to
+     * whichever ceiling this platform's colour ramp uses, so "fully worried
+     * about the disk" is the same red as "fully stalled". */
+    disk_trend_tick();
+    {
+        int dw  = disk_worry();
+        int hot = g_press.true_stall ? 350 : 950;
+        int as_pressure = dw * hot / 1000;
+        if (as_pressure > worst) worst = as_pressure;
+    }
+
+    /* Ease towards the reading so the moon shifts colour rather than
+     * flicking between states on a passing spike. */
+    g_press_worst += (worst - g_press_worst) / 4;
+}
+
+/* Calm cyan when nothing is waiting, through amber, to red when the machine
+ * is genuinely struggling.
+ *
+ * The thresholds are C0ry's: he warns at 5% memory stall and 35% CPU stall,
+ * because those are the points where waiting stops being noise. Where the
+ * platform reports utilisation instead of stall (Windows), the same scale
+ * would cry wolf at an idle machine -- 40% CPU busy is nothing -- so it is
+ * stretched to match what the number actually means. */
+static void moon_color(float* r, float* g_, float* b) {
+    int worst = g_press_worst, floor_, hot;
+    if (g_press.true_stall) {
+        /* Real stall. C0ry warns at 5% memory and 35% CPU because that is
+         * where waiting stops being noise, so any stall at all is worth
+         * showing and the scale starts at zero. */
+        floor_ = 0;
+        hot    = 350;
+    } else {
+        /* Utilisation. Starting at zero would have the moon pink whenever
+         * anything happened -- half a machine at work is a machine doing its
+         * job, not a machine in trouble. Nothing below 50%, full red by 95%. */
+        floor_ = 500;
+        hot    = 950;
+    }
+    if (worst < floor_) worst = floor_;
+    if (worst > hot)    worst = hot;
+    float t = (hot > floor_) ? (float)(worst - floor_) / (float)(hot - floor_)
+                             : 0.0f;
+    /* cyan (0.62,0.90,1.00) -> red (1.00,0.35,0.30) */
+    *r  = 0.62f + t * (1.00f - 0.62f);
+    *g_ = 0.90f + t * (0.35f - 0.90f);
+    *b  = 1.00f + t * (0.30f - 1.00f);
+}
+
+/* Click the moon: what is this machine actually doing? */
+static void moon_clicked(void) {
+    char body[400];
+    int n = 0;
+    if (!g_press.true_stall) {
+        /* Say plainly that this is not stall pressure. Reporting "CPU 40%" as
+         * though it were PSI would be inventing a measurement. */
+        n += snprintf(body + n, sizeof body - n,
+                      "Windows has no stall pressure, so this is what it does "
+                      "know -- and memory being full is not a complaint, "
+                      "unused memory is wasted memory: ");
+        if (g_press.mem >= 0)
+            n += snprintf(body + n, sizeof body - n, "memory %d%% full",
+                          g_press.mem / 10);
+        if (g_press.cpu >= 0)
+            n += snprintf(body + n, sizeof body - n, "%sCPU %d%% busy",
+                          g_press.mem >= 0 ? ", " : "", g_press.cpu / 10);
+        snprintf(body + n, sizeof body - n, ".");
+    } else {
+        n += snprintf(body + n, sizeof body - n,
+                      "Share of the last minute something spent WAITING -- ");
+        n += snprintf(body + n, sizeof body - n, "memory %d.%d%%",
+                      g_press.mem / 10, g_press.mem % 10);
+        n += snprintf(body + n, sizeof body - n, ", cpu %d.%d%%",
+                      g_press.cpu / 10, g_press.cpu % 10);
+        n += snprintf(body + n, sizeof body - n, ", io %d.%d%%",
+                      g_press.io / 10, g_press.io % 10);
+        snprintf(body + n, sizeof body - n,
+                 ". Busy is not the same as suffering: this counts only time "
+                 "spent stalled.");
+    }
+    /* The disk gets its own sentence, and the RATE before the level -- the
+     * rate is the part you can still do something about. */
+    if (g_press.disk_used >= 0) {
+        int gb_free = g_press.disk_free_mb / 1024;
+        if (g_disk_rate_mbh < -50) {
+            n += snprintf(body + n, sizeof body - n,
+                          "  Disk: %d%% full, %d GB left, and LOSING about "
+                          "%d.%d GB an hour.",
+                          g_press.disk_used / 10, gb_free,
+                          -g_disk_rate_mbh / 1024, (-g_disk_rate_mbh % 1024) / 103);
+        } else {
+            n += snprintf(body + n, sizeof body - n,
+                          "  Disk: %d%% full, %d GB left, holding steady.",
+                          g_press.disk_used / 10, gb_free);
+        }
+    }
+    popup_mode("C0RY", g_press_worst > 350 ? "STRAINING" : "AT REST", "%s", body);
+    log_write("moon", "C0ry: mem=%d cpu=%d io=%d (tenths, stall=%d)",
+              g_press.mem, g_press.cpu, g_press.io, g_press.true_stall ? 1 : 0);
+}
+
+static void draw_moon(int w, int h) {
+    if (!g.moon_on) return;
+    /* Depth as size and light. It cannot be occlusion -- the moon is never
+     * allowed in front of the orb -- so a quarter's worth of size and a
+     * little brightness is what carries the third dimension. */
+    int r = moon_radius();
+    int dz = g_moon.depth;                 /* -1000 .. +1000 */
+    if (dz >  1000) dz =  1000;
+    if (dz < -1000) dz = -1000;
+    r = r * (1000 + dz / 4) / 1000;
+    if (r < 3) r = 3;
+    float lit = 0.82f + 0.18f * (float)dz / 1000.0f;
+    float cx = (float)(w / 2 + g_moon.x / MOON_HP);
+    float cy = (float)(h / 2 + g_moon.y / MOON_HP);
+
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glOrtho(0, w, h, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glDisable(GL_DEPTH_TEST);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    float mr, mg, mb;
+    moon_color(&mr, &mg, &mb);
+
+    /* Body. */
+    glColor4f(mr * 0.35f * lit, mg * 0.35f * lit, mb * 0.40f * lit, 0.92f);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(cx, cy);
+    for (int i = 0; i <= MOON_STEPS; i++)
+        glVertex2f(cx + (float)r * moon_cos(i) / 1000.0f,
+                   cy + (float)r * moon_sin(i) / 1000.0f);
+    glEnd();
+
+    /* Rim -- brighter while it is paying attention to you. */
+    glColor4f(mr * lit, mg * lit, mb * lit,
+              g_moon.following ? 1.0f : (0.55f + 0.25f * (float)(dz + 1000) / 2000.0f));
+    glLineWidth(g_moon.following ? 2.4f : 1.6f);
+    glBegin(GL_LINE_LOOP);
+    for (int i = 0; i < MOON_STEPS; i++)
+        glVertex2f(cx + (float)r * moon_cos(i) / 1000.0f,
+                   cy + (float)r * moon_sin(i) / 1000.0f);
+    glEnd();
+
+    /* A highlight, so it reads as a body rather than a dot. */
+    int hr = r / 3; if (hr < 2) hr = 2;
+    glColor4f(mr, mg, mb, 0.55f);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(cx - r * 0.3f, cy - r * 0.3f);
+    for (int i = 0; i <= MOON_STEPS; i += 2)
+        glVertex2f(cx - r * 0.3f + (float)hr * moon_cos(i) / 1000.0f,
+                   cy - r * 0.3f + (float)hr * moon_sin(i) / 1000.0f);
+    glEnd();
+
+    glLineWidth(1.0f);
+    glEnable(GL_DEPTH_TEST);
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW); glPopMatrix();
+}
+
+/* ── the click splash ──────────────────────────────────────────────────
+ *
+ * Click the orb and colour runs across its cage.
+ *
+ * A single click was the last free gesture on the orb -- double-click arms,
+ * drag moves, right-click opens the menu, middle-click is the clipboard --
+ * and it had no answer at all, so the orb felt inert under the one gesture
+ * people try first.
+ *
+ * It is a WAVE, not a flash. The cage is sixteen latitude rings, so lighting
+ * them in sequence costs nothing and reads as something travelling over a
+ * surface, where lighting them together just reads as a bulb. The colour
+ * moves on with every click, because the second click should not look like a
+ * repeat of the first.
+ */
+#define SPLASH_MS   750.0
+static uint64_t g_splash_start = 0;
+static int      g_splash_which = 0;
+
+static void splash_fire(void) {
+    g_splash_start = plat_now_ms();
+    g_splash_which++;
+}
+
+/* 0 when nothing is happening, otherwise 0..1 across the whole animation. */
+static double splash_phase(void) {
+    if (!g_splash_start) return 0.0;
+    double t = (double)(plat_now_ms() - g_splash_start) / SPLASH_MS;
+    if (t >= 1.0) { g_splash_start = 0; return 0.0; }
+    return t;
+}
+
+static void splash_color(float* r, float* g_, float* b) {
+    static const float C[6][3] = {
+        { 0.30f, 0.85f, 1.00f },   /* cyan     */
+        { 1.00f, 0.45f, 0.85f },   /* magenta  */
+        { 1.00f, 0.80f, 0.25f },   /* amber    */
+        { 0.45f, 1.00f, 0.55f },   /* green    */
+        { 0.70f, 0.55f, 1.00f },   /* violet   */
+        { 1.00f, 0.55f, 0.35f },   /* coral    */
+    };
+    int i = ((g_splash_which % 6) + 6) % 6;
+    *r = C[i][0]; *g_ = C[i][1]; *b = C[i][2];
+}
+
+/* How lit ring `i` of `n` is, for a wave that sweeps pole to pole. */
+static float splash_at(double phase, int i, int n) {
+    if (phase <= 0.0) return 0.0f;
+    /* The wave front reaches the last ring just as the animation ends. */
+    double lead = (n > 1) ? (double)i / (double)(n - 1) * 0.45 : 0.0;
+    double p = (phase - lead) / 0.55;
+    if (p <= 0.0 || p >= 1.0) return 0.0f;
+    return (float)sin(M_PI * p);          /* up and back down */
+}
+
 static void draw_orb(int win_w, int win_h) {
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -1715,17 +2378,48 @@ static void draw_orb(int win_w, int win_h) {
     /* Cage: translucent white shell, independent of state. Kept faint on
      * purpose -- at 0.45 the wireframe washed the core out and the orb read
      * as a white blob with no state at all. */
+    double sph = splash_phase();
+    float sr = 1.0f, sg = 1.0f, sb = 1.0f;
+    if (sph > 0.0) splash_color(&sr, &sg, &sb);
+
     glColor4f(1.0f, 1.0f, 1.0f, 0.28f * pulse);
     for (int i = 0; i <= 16; i++) {
         float lat = (float)(M_PI * (-0.5 + (double)i / 16));
         float z = sinf(lat) * 0.5f;
         float zr = cosf(lat) * 0.5f;
+        /* Per-ring, so the colour travels along the cage instead of the
+         * whole thing blinking at once. */
+        float k = splash_at(sph, i, 17);
+        if (k > 0.0f) {
+            glColor4f(1.0f + (sr - 1.0f) * k,
+                      1.0f + (sg - 1.0f) * k,
+                      1.0f + (sb - 1.0f) * k,
+                      (0.28f + 0.62f * k) * pulse);
+            glLineWidth(1.5f + 1.6f * k);
+        } else {
+            glColor4f(1.0f, 1.0f, 1.0f, 0.28f * pulse);
+            glLineWidth(1.5f);
+        }
         glBegin(GL_LINE_LOOP);
         for (int j = 0; j <= 24; j++) {
             float lng = (float)(2.0 * M_PI * j / 24.0);
             glVertex3f(cosf(lng) * zr, sinf(lng) * zr, z);
         }
         glEnd();
+    }
+    /* The meridians take the wave's envelope rather than a position of their
+     * own -- each one spans every latitude, so there is no single ring for it
+     * to belong to. */
+    float env = splash_at(sph, 8, 17);
+    if (env > 0.0f) {
+        glColor4f(1.0f + (sr - 1.0f) * env * 0.8f,
+                  1.0f + (sg - 1.0f) * env * 0.8f,
+                  1.0f + (sb - 1.0f) * env * 0.8f,
+                  (0.28f + 0.40f * env) * pulse);
+        glLineWidth(1.5f + 0.8f * env);
+    } else {
+        glColor4f(1.0f, 1.0f, 1.0f, 0.28f * pulse);
+        glLineWidth(1.5f);
     }
     for (int j = 0; j <= 24; j++) {
         float lng = (float)(2.0 * M_PI * j / 24.0);
@@ -1740,7 +2434,13 @@ static void draw_orb(int win_w, int win_h) {
     }
     /* Core: full strength and a little larger, so the state colour is what
      * you actually see through the cage. */
-    glColor4f(r, gc, b, 0.97f * pulse);
+    /* A little of it reaches the core too. Kept small on purpose: the core's
+     * colour IS the orb's state, and a splash that recoloured it would be
+     * saying the state had changed when it had not. */
+    glColor4f(r + (sr - r) * env * 0.25f,
+              gc + (sg - gc) * env * 0.25f,
+              b + (sb - b) * env * 0.25f, 0.97f * pulse);
+    glLineWidth(1.5f);
     GLUquadric* quad = gluNewQuadric();
     gluSphere(quad, 0.34f, 20, 20);
     gluDeleteQuadric(quad);
@@ -3884,6 +4584,83 @@ static void clip_show_menu(void) {
     log_write("clip", "restored entry %d of %d", pick + 1, g_nclips);
 }
 
+/* Declared here because the ghost starts a recording before the file gets
+ * round to defining how. */
+static void start_video_monitor(PlatMonitor m);
+
+/* The ghost, once it is up: film the rectangle it was given, then leave. */
+static void ghost_begin(void) {
+    char run[512];
+    ghost_paths(NULL, 0, run, sizeof run);
+    FILE* f = fopen(run, "wb");
+    if (f) { fprintf(f, "filming\n"); fclose(f); }
+
+    log_write("ghost", "filming %dx%d at (%d,%d) as %s for up to %ds",
+              g_ghost_rect.w, g_ghost_rect.h, g_ghost_rect.x, g_ghost_rect.y,
+              g_ghost_video ? "MP4" : "GIF", g_ghost_secs);
+
+    if (g_ghost_video) start_video_monitor(g_ghost_rect);
+    else               start_recording_monitor(g_ghost_rect);
+
+    g_ghost_began = plat_now_ms();
+}
+
+static void ghost_tick(void) {
+    if (!g_ghost || !g_ghost_began) return;
+    char stop[512], run[512];
+    ghost_paths(stop, sizeof stop, run, sizeof run);
+
+    bool times_up = (plat_now_ms() - g_ghost_began)
+                    >= (uint64_t)g_ghost_secs * 1000ULL;
+    bool asked    = file_exists(stop);
+
+    if (g.state == ORB_RECORDING && (times_up || asked)) {
+        log_write("ghost", "stopping -- %s", asked ? "asked to" : "time is up");
+        stop_recording();
+    }
+    if (g.state != ORB_RECORDING) {
+        /* Clear the handshake before leaving, or the orb's menu goes on
+         * offering to stop a ghost that is already gone. */
+        remove(run);
+        remove(stop);
+        log_write("ghost", "done");
+        glfwSetWindowShouldClose(g.window, 1);
+    }
+}
+
+/* The MAIN copy's side: start a ghost, or ask a running one to stop. */
+static void film_the_orb(bool video) {
+    char stop[512], run[512];
+    ghost_paths(stop, sizeof stop, run, sizeof run);
+
+    if (file_exists(run)) {
+        FILE* f = fopen(stop, "wb");
+        if (f) { fprintf(f, "stop\n"); fclose(f); }
+        popup("CUT", "Asked the ghost recorder to stop and save.");
+        log_write("ghost", "asked the ghost to stop");
+        return;
+    }
+    remove(stop);
+
+    int wx = 0, wy = 0;
+    glfwGetWindowPos(g.window, &wx, &wy);
+    char args[256];
+    snprintf(args, sizeof args, "--ghost %s %d %d %d %d %d",
+             video ? "mp4" : "gif", wx, wy, ORB_WIN_SIZE, ORB_WIN_SIZE, 180);
+
+    if (plat_spawn_self(args)) {
+        popup_mode(video ? "MP4" : "GIF", "FILMING",
+                   "A hidden copy is filming the orb. It has no idea the orb "
+                   "is special, so you get the orb as it really is -- idle, "
+                   "armed, whatever you do to it. Stop from this menu.");
+        log_write("ghost", "spawned a ghost to film (%d,%d) %dx%d",
+                  wx, wy, ORB_WIN_SIZE, ORB_WIN_SIZE);
+    } else {
+        popup("NO GHOST", "Could not start the ghost recorder.");
+        log_write("ghost", "spawn failed");
+    }
+}
+
 static PlatMenuState menu_state(void) {
     PlatMenuState st;
     for (int i = 0; i < PLAT_HK_COUNT; i++) st.hotkey_on[i] = g.hotkey_on[i];
@@ -3894,6 +4671,11 @@ static PlatMenuState menu_state(void) {
     st.audio_src = g.audio_src;
     st.dbl_video = g.dbl_video;
     st.clip_keep = g.clip_keep;
+    st.moon_on   = g.moon_on;
+    /* Asked fresh every time the menu opens: the ghost may have stopped
+     * itself on its timer since we last looked. */
+    st.ghost_on  = ghost_is_running();
+    st.draw_cursor = g.draw_cursor;
     /* Asked of the OS every time the menu opens, not remembered -- the
      * user can remove the entry from Settings and the tick must follow. */
     st.run_at_startup = plat_get_run_at_startup();
@@ -4005,6 +4787,31 @@ static void handle_menu_command(int cmd) {
                                        "the system image editor" };
         popup_mode("PNG", "AFTER", "Screenshots now open %s.", WHAT[g.shot_editor]);
         settings_mark_dirty();
+    } else if (cmd == PLAT_MENU_FILM_GIF) {
+        film_the_orb(false);
+    } else if (cmd == PLAT_MENU_FILM_MP4) {
+        film_the_orb(true);
+    } else if (cmd == PLAT_MENU_FILM_STOP) {
+        film_the_orb(false);            /* running -> this stops it */
+    } else if (cmd == PLAT_MENU_TOGGLE_CURSOR) {
+        g.draw_cursor = !g.draw_cursor;
+        plat_capture_draw_cursor(g.draw_cursor);
+        popup(g.draw_cursor ? "MOUSE ON" : "MOUSE OFF",
+              g.draw_cursor ? "The mouse pointer will appear in recordings "
+                              "and screenshots."
+                            : "Recordings will not show the mouse pointer.");
+        settings_mark_dirty();
+        log_write("cfg", "draw cursor: %s", g.draw_cursor ? "on" : "off");
+    } else if (cmd == PLAT_MENU_TOGGLE_MOON) {
+        g.moon_on = !g.moon_on;
+        g_moon.region_stale = true;
+        orb_apply_region(false);       /* the region must drop it immediately */
+        popup(g.moon_on ? "MOON ON" : "MOON OFF",
+              g.moon_on ? "C0ry is circling the orb. Click the moon to ask "
+                          "how hard this machine is working."
+                        : "The moon is gone.");
+        settings_mark_dirty();
+        log_write("moon", "moon %s", g.moon_on ? "on" : "off");
     } else if (cmd >= PLAT_MENU_CLIPHIST_BASE && cmd <= PLAT_MENU_CLIPHIST_LAST) {
         static const int CHV[PLAT_CLIPHIST_CHOICES] = { 0, 5, 10, 20 };
         g.clip_keep = CHV[cmd - PLAT_MENU_CLIPHIST_BASE];
@@ -4092,6 +4899,14 @@ static void on_mouse_button(GLFWwindow* win, int button, int action, int mods) {
     /* The rings must never be in the way -- touching the orb ends them. */
     if (action == GLFW_PRESS) ping_cancel();
     uint64_t now = plat_now_ms();
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+        /* The moon shares the orb's window, so without this a click on it
+         * would start dragging the orb from wherever the moon happened to
+         * be -- the orb would teleport out from under the pointer. */
+        double mx = 0, my = 0;
+        glfwGetCursorPos(g.window, &mx, &my);
+        if (moon_hit(mx, my)) { moon_clicked(); return; }
+    }
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS) {
             if (now - g.lastClickMs < 400) {
@@ -4112,6 +4927,11 @@ static void on_mouse_button(GLFWwindow* win, int button, int action, int mods) {
                 }
                 g.lastClickMs = 0;
             } else {
+                /* The one gesture that had no answer. Fired on press rather
+                 * than release so it lands the instant you click, and before
+                 * we know whether this will turn into a drag -- a splash that
+                 * waited to find out would feel late. */
+                splash_fire();
                 g.lastClickMs = now;
                 /* Grab offset must be measured from where the orb actually
                  * is, or the first drag tick teleports it to g.orb_x and
@@ -4153,6 +4973,7 @@ static void draw_orb_frame(void) {
     draw_orb(w, h);
     glViewport(0, 0, w, h);              /* rings + toast use the whole window */
     draw_ping_rings(w, h);
+    draw_moon(w, h);
     draw_popup_overlay(w, h);
     glfwSwapBuffers(g.window);
 }
@@ -4761,8 +5582,30 @@ int main(int argc, char** argv) {
      * key dead and a menu of unchecked boxes. Joe hit exactly that: the log
      * read "F4/F6/F7/F8/F9 refused -- another app owns it" and it looked like
      * a broken install rather than a duplicate. */
-    if (!plat_single_instance()) {
-        fprintf(stderr, "ORB_Recorder is already running.\n");
+    /* --ghost <gif|mp4> <x> <y> <w> <h> <seconds>
+     *
+     * Parsed before anything else, because it changes which instance lock we
+     * take and whether we may touch the settings file. */
+    for (int i = 1; i + 6 < argc; i++) {
+        if (strcmp(argv[i], "--ghost") != 0) continue;
+        g_ghost       = true;
+        g_ghost_video = (strcmp(argv[i + 1], "mp4") == 0);
+        g_ghost_rect.x = atoi(argv[i + 2]);
+        g_ghost_rect.y = atoi(argv[i + 3]);
+        g_ghost_rect.w = atoi(argv[i + 4]);
+        g_ghost_rect.h = atoi(argv[i + 5]);
+        g_ghost_secs   = atoi(argv[i + 6]);
+        if (g_ghost_secs < 2)   g_ghost_secs = 2;
+        if (g_ghost_secs > 900) g_ghost_secs = 900;
+        snprintf(g_ghost_rect.name, sizeof g_ghost_rect.name, "Orb");
+        break;
+    }
+
+    /* Different locks. One orb, one ghost, and they do not exclude each
+     * other -- see the note beside g_ghost for why that is safe. */
+    if (!plat_single_instance(g_ghost ? "ghost" : "single")) {
+        fprintf(stderr, g_ghost ? "A ghost recorder is already filming.\n"
+                                : "ORB_Recorder is already running.\n");
         return 0;
     }
 
@@ -4772,6 +5615,12 @@ int main(int argc, char** argv) {
     g.auto_clipboard = true;
     g.shot_editor    = 1;
     g.clip_keep      = 0;      /* clipboard history is opt-in */
+    g.moon_on        = true;
+    /* On by default. A recording of somebody USING something is not a
+     * recording of anything if the pointer is invisible: Joe filmed the
+     * moon chasing his mouse and it read as the moon having a fit,
+     * because the thing it was chasing could not be seen. */
+    g.draw_cursor    = true;
     g.audio_src      = PLAT_AUDIO_SYSTEM;   /* settings_load may override */
     for (int i = 0; i < PLAT_HK_COUNT; i++) g.hotkey_on[i] = true;
     g.gw_open = false;
@@ -5031,6 +5880,14 @@ int main(int argc, char** argv) {
     g.native = plat_get_orb_native_handle(g.window);
     log_write("boot", "window set up; native handle acquired");
 
+    /* The ghost needs the window -- the capture path and the GL context
+     * hang off it -- but must never be seen, least of all by the recording
+     * it is making. */
+    if (g_ghost) {
+        plat_window_set_visible(g.window, false);
+        plat_tray_set(g.window, false, NULL);
+    }
+
     /* Only hook the clipboard if the user actually asked for a history -- no
      * listener, no events, nothing recorded.
      *
@@ -5038,6 +5895,7 @@ int main(int argc, char** argv) {
      * is registered against a window handle, and at settings-load time there
      * is no window yet, so the call quietly did nothing. */
     if (g.clip_keep > 0) plat_clipboard_watch(g.window);
+    plat_capture_draw_cursor(g.draw_cursor);
     log_write("boot", "integrity: %s",
               plat_process_is_elevated() ? "ELEVATED (admin)" : "normal user");
 
@@ -5115,7 +5973,12 @@ int main(int argc, char** argv) {
             if (hk == PLAT_HK_ESCAPE) handle_escape();
         }
         glfwPollEvents();
+        if (g_ghost) {
+            if (!g_ghost_began) ghost_begin();
+            ghost_tick();
+        }
         clip_poll();
+        moon_tick();
 
         /* Brought forward, restored, or the tray icon clicked -> locate. */
         if (plat_poll_activation()) ping_start_for(PING_MS_LONG);

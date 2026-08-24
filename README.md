@@ -52,12 +52,166 @@ whatever else wants it.
 **Drop a file on the orb.** GIFs open a frame editor with trim. Images open
 the annotation editor. Videos open in your default player.
 
+**Film the orb itself** — a hidden second copy records the visible one, so you
+can finally capture it at rest rather than permanently red. **The mouse pointer
+is drawn into recordings**, and clicking the orb splashes colour across its cage.
+
+**The orb has a moon.** It circles, and comes to meet your cursor when you
+get close. It is C0ry — the Core Memory Controller — and its colour is how
+hard the machine is straining, measured as time spent *waiting* rather than
+time spent busy.
+
 **Middle-click the orb** for clipboard history — the last few things you
 copied, in memory only, never written to disk and never sent anywhere. Off by
 default; anything a password manager marks secret is refused.
 
 Colour is state: orange idle, yellow armed, **red recording GIF**, **magenta
 recording video**, **cyan recording camera**, green editing.
+
+---
+
+## New in 3.20 — a ghost that films the orb, and a pointer you can see
+
+### The orb could never be filmed at rest
+
+It could always record itself — but an orb recording itself goes **red and
+pulses while it does it**, so the one thing you could never capture was the orb
+idle. Or armed. Or playing tag with its moon. Every recording of the orb was a
+recording of the orb recording.
+
+Joe's fix, and the joke in it is the design: *"we make a venv in ram launch a
+hidden orb to record the orb or any window (that refuses to know the orb)."*
+
+The recorder knows about the orb and leaves it out of its own captures. A
+**second, invisible copy that refuses to know the orb films it like any other
+window**, with no special case at all. Right-click → *Film the orb itself*.
+
+The single-instance lock stays, because two visible copies would fight over
+F4–F9 and come up with every hotkey dead. The ghost sidesteps it by never
+asking for a hotkey — and never writing settings either, or its defaults would
+overwrite wherever you had parked the real orb. The two find each other through
+two files in the temp directory, which on Linux is `XDG_RUNTIME_DIR` and so is
+genuinely in RAM.
+
+### You can see the mouse now
+
+Screen capture does not include the cursor — the compositor draws it on top
+afterwards, so it is in nobody's pixels. It has to be fetched and composited by
+hand: `GetCursorInfo`/`DrawIconEx` on Windows, `XFixesGetCursorImage` on X11.
+
+Joe filmed the moon chasing his pointer and the result was baffling — the moon
+lunging around an empty screen, because the thing it was chasing was invisible.
+**A recording of an interaction is not a recording of anything unless you can
+see the pointer.** On by default; there is a checkbox.
+
+The X11 path has both of Xlib's classic traps in one struct: the cursor's
+`pixels` are `unsigned long`, so each is **eight bytes on 64-bit** with only the
+low 32 holding colour, and the data is **premultiplied** ARGB, so it must not be
+multiplied by alpha a second time.
+
+### The orbit is three-dimensional
+
+*"can we make it orbit in a slightly more random way it is just in one plane."*
+
+A circle seen at an angle is an ellipse, so a tilted orbit is the unit circle
+squashed along one axis and then turned. Both the squash and the turn drift, at
+periods of 47 and 29 frames — deliberately not multiples of one another, so the
+moon never retraces the same ellipse. Still base 60, still no floating point in
+the motion.
+
+Depth shows as size and brightness rather than occlusion, because the moon is
+**forbidden to cross in front of the orb**: *"the main planet right click drag
+can't be obfuscated by the moon."* There is a hard floor on how near its centre
+may come, enforced on the target rather than the position, so it slides around
+the edge instead of stopping dead — and pointing at the orb makes it step
+politely aside. The first version of that floor used the moon's resting size and
+Joe caught it clipping the cage on film; the near side of the orbit draws it 25%
+larger and the orb pulses 10% larger while recording, and neither was in the sum.
+
+### Click the orb and it splashes
+
+Single click was the last free gesture — double-click arms, drag moves,
+right-click opens the menu, middle-click is the clipboard — and it had no answer
+at all, so the orb felt inert under the gesture people try first.
+
+It is a **wave, not a flash**: the cage is sixteen latitude rings, so lighting
+them in sequence reads as something travelling over a surface where lighting
+them together just reads as a bulb. The colour advances every click, because the
+second click should not look like a repeat of the first.
+
+### C0ry watches the disk
+
+The moon is C0ry — the Core Memory Controller — and its colour is how hard the
+machine is straining. It now watches the disk as well, and watches the **rate**,
+not just the level: free space sampled against an hour-old mark, red when the
+drive is nearly full **or** losing more than a gigabyte an hour.
+
+The level alone is the wrong alarm. A drive at 80% has been fine for months; a
+drive that has dropped 30 GB since morning is on its way to zero whatever it
+currently reads.
+
+That distinction had to be learned twice. The first version coloured the moon by
+memory *fullness*, so an ordinary desktop at 65% RAM glowed permanently alarmed —
+**memory being full is not strain, unused memory is wasted memory, that is what
+it is for.** The second version cried wolf at 40% CPU, which on a many-core
+machine is nothing. Where a platform reports utilisation rather than true stall
+pressure, the scale now starts at half the machine and says plainly that it is
+not measuring what PSI measures.
+
+---
+
+## New in 3.19 — the orb has a moon
+
+A small satellite circles the orb. Bring your cursor near and it comes out to
+meet you; leave, and it rejoins its orbit from wherever it happens to be.
+
+Joe asked for it in one line — *"the orb has a moon that follows your cursor
+once your mouse gets close to it, the moon is the AI"* — and that last clause
+is the design. The moon is not decoration. It is **C0ry**, and its colour is
+how hard this machine is straining.
+
+### Strain, not busyness
+
+C0ry_AI is the Core Memory Controller: it watches **PSI**, the share of time
+tasks spent *stalled waiting* for memory, CPU or IO. That is a different
+question from utilisation, and a better one — a machine at 100% CPU with
+nothing waiting is working, while one at 40% with everything waiting is
+suffering. Busy is not the same as suffering.
+
+On Linux the moon reads `/proc/pressure` directly, so those are real stall
+figures. **Windows has no PSI**, so it reports what it does know — memory load
+and CPU busy — and says so rather than dressing utilisation up as pressure.
+
+That distinction had teeth. The first version coloured the moon by memory
+*fullness*, so on an ordinary desktop sitting at 65% RAM it glowed an alarmed
+orange — permanently worried about nothing. **Memory being full is not strain;
+unused memory is wasted memory, that is what it is for.** Now CPU carries the
+colour and memory only counts past 90%, where running out is actually
+imminent.
+
+Click the moon and it tells you what it can see.
+
+### It orbits in base 60
+
+Sixty positions around the circle, an integer sine table, no trigonometry and
+no floating point anywhere in its motion — positions are half-pixels, the same
+fixed point the annotation editor uses. An orbit is a lookup, not a
+calculation.
+
+Two things that were not obvious:
+
+- **A window is clipped to its region**, and the orb's region is a circle
+  barely bigger than the orb. The moon was drawn correctly and was completely
+  invisible until the region learned to follow it. The region is also the
+  *clickable* area, which is why the moon can be clicked at all — and why a
+  click on it has to be caught before the drag handler, or the orb teleports
+  out from under your pointer.
+- **Speed had to be set by eye.** At the first setting the moon lapped the orb
+  every four seconds, which does not read as an orbit — it reads as something
+  spinning, or broken. A lap takes about thirteen seconds now: slow enough
+  that you notice it *has* moved rather than watching it move.
+
+Turn it off in the right-click menu if you would rather not have company.
 
 ---
 

@@ -41,6 +41,7 @@
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/extensions/shape.h>
+#include <sys/statvfs.h>
 
 #include <sys/un.h>
 #include <sys/socket.h>
@@ -336,7 +337,8 @@ void plat_window_set_circular(struct GLFWwindow* w, int diameter) {
 
 void plat_window_set_shape(struct GLFWwindow* w,
                            int bx, int by, int diameter,
-                           int rx, int ry, int rw, int rh) {
+                           int rx, int ry, int rw, int rh,
+                           int mx, int my, int md) {
     Window x11w = glfwGetX11Window(w);
     int major = 0, minor = 0;
     if (!XShapeQueryVersion(dpy(), &major, &minor)) return;
@@ -355,6 +357,7 @@ void plat_window_set_shape(struct GLFWwindow* w,
     XSetForeground(dpy(), gc, 1);
     XFillArc(dpy(), mask, gc, bx, by, diameter, diameter, 0, 360 * 64);
     if (rw > 0 && rh > 0) XFillRectangle(dpy(), mask, gc, rx, ry, rw, rh);
+    if (md > 0) XFillArc(dpy(), mask, gc, mx, my, md, md, 0, 360 * 64);
     XFreeGC(dpy(), gc);
     XShapeCombineMask(dpy(), x11w, ShapeBounding, 0, 0, mask, ShapeSet);
     XShapeCombineMask(dpy(), x11w, ShapeInput,    0, 0, mask, ShapeSet);
@@ -501,13 +504,90 @@ static uint8_t* resample_to_rgba(XImage* img, int capW, int capH) {
     return out;
 }
 
+/* ---- the mouse pointer, composited into captures ----------------------
+ *
+ * X does not put the cursor in the root window's pixels either -- it is drawn
+ * by the server on top. XFixes hands it over as an image, from the same
+ * library already opened for the clipboard.
+ *
+ * TWO TRAPS, both the classic Xlib one:
+ *   - `pixels` is `unsigned long *`, so each pixel occupies EIGHT bytes on
+ *     64-bit while only the low 32 hold the colour.
+ *   - the data is PREMULTIPLIED ARGB, so it composites with (1 - alpha) on
+ *     the destination and must NOT be multiplied by alpha again.
+ */
+typedef struct {
+    short           x, y;
+    unsigned short  width, height;
+    unsigned short  xhot, yhot;
+    unsigned long   cursor_serial;
+    unsigned long*  pixels;
+    Atom            atom;
+    const char*     name;
+} OrbCursorImage;
+typedef OrbCursorImage* (*fn_xfixes_cursor)(Display*);
+static fn_xfixes_cursor p_xfixes_cursor = NULL;
+static bool g_cap_cursor = false;
+
+void plat_capture_draw_cursor(bool on) {
+    g_cap_cursor = on;
+    if (on && !p_xfixes_cursor) {
+        void* lib = dlopen("libXfixes.so.3", RTLD_LAZY);
+        if (!lib) lib = dlopen("libXfixes.so", RTLD_LAZY);
+        if (lib) p_xfixes_cursor =
+            (fn_xfixes_cursor)dlsym(lib, "XFixesGetCursorImage");
+        if (!p_xfixes_cursor)
+            fprintf(stderr, "[orb] no XFixes cursor -- pointer will not be "
+                            "drawn into recordings\n");
+    }
+}
+
+/* Composite the pointer into an RGBA buffer.
+ * (ox, oy) is where the buffer's top-left sits in ROOT coordinates. */
+static void cursor_into_rgba(uint8_t* rgba, int capW, int capH,
+                             int ox, int oy, int srcW, int srcH) {
+    if (!g_cap_cursor || !p_xfixes_cursor || !rgba) return;
+    if (srcW <= 0 || srcH <= 0) return;
+    OrbCursorImage* ci = p_xfixes_cursor(dpy());
+    if (!ci) return;
+
+    for (int cy = 0; cy < (int)ci->height; cy++) {
+        for (int cx = 0; cx < (int)ci->width; cx++) {
+            unsigned long px = ci->pixels[(size_t)cy * ci->width + cx];
+            uint8_t a = (uint8_t)((px >> 24) & 0xFF);
+            if (!a) continue;
+            /* Where this cursor pixel lands, in captured coordinates. */
+            int sx = ci->x - ci->xhot + cx - ox;
+            int sy = ci->y - ci->yhot + cy - oy;
+            int dx = (int)((long long)sx * capW / srcW);
+            int dy = (int)((long long)sy * capH / srcH);
+            if (dx < 0 || dy < 0 || dx >= capW || dy >= capH) continue;
+
+            uint8_t* d = rgba + ((size_t)dy * capW + dx) * 4;
+            uint8_t sr = (uint8_t)((px >> 16) & 0xFF);
+            uint8_t sg = (uint8_t)((px >> 8) & 0xFF);
+            uint8_t sb = (uint8_t)(px & 0xFF);
+            /* Premultiplied: src + dst * (1 - a). */
+            int inv = 255 - a;
+            d[0] = (uint8_t)(sr + (d[0] * inv) / 255);
+            d[1] = (uint8_t)(sg + (d[1] * inv) / 255);
+            d[2] = (uint8_t)(sb + (d[2] * inv) / 255);
+            d[3] = 255;
+        }
+    }
+    XFree(ci);
+}
+
 uint8_t* plat_capture_rect(int x, int y, int w, int h, int capW, int capH) {
     if (w <= 0 || h <= 0) return NULL;
     if (!ensure_shm(w, h)) return NULL;
     if (!XShmGetImage(dpy(), DefaultRootWindow(dpy()), g_shm_img, x, y, AllPlanes)) {
         return NULL;
     }
-    return resample_to_rgba(g_shm_img, capW, capH);
+    uint8_t* out = resample_to_rgba(g_shm_img, capW, capH);
+    /* A screen grab's origin IS its screen position. */
+    cursor_into_rgba(out, capW, capH, x, y, w, h);
+    return out;
 }
 
 uint8_t* plat_capture_window(void* native_handle, int capW, int capH,
@@ -871,6 +951,14 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                          "%sHotkey %s", onoff(st->hotkey_on[i]), HKN[i]);
     }
     n = menu_sep(rows, n);
+    n = menu_add(rows, n, PLAT_MENU_TOGGLE_CURSOR,   "%sRecord the mouse pointer", onoff(st->draw_cursor));
+    n = menu_add(rows, n, PLAT_MENU_TOGGLE_MOON,     "%sMoon (C0ry)", onoff(st->moon_on));
+    if (st->ghost_on)
+        n = menu_add(rows, n, PLAT_MENU_FILM_STOP,  "Stop filming the orb");
+    else {
+        n = menu_add(rows, n, PLAT_MENU_FILM_GIF,   "Film the orb itself -> GIF");
+        n = menu_add(rows, n, PLAT_MENU_FILM_MP4,   "Film the orb itself -> MP4");
+    }
     n = menu_add(rows, n, PLAT_MENU_TOGGLE_AUTOOPEN, "%sOpen folder after saving", onoff(st->auto_open));
     n = menu_add(rows, n, PLAT_MENU_TOGGLE_CLIP,     "%sCopy file to clipboard", onoff(st->auto_clip));
     {
@@ -2060,6 +2148,105 @@ int plat_show_list_menu(struct GLFWwindow* w, const char* const* items, int n,
     return chosen > 0 ? chosen - 1 : -1;
 }
 
+/* ---- pressure, straight from PSI --------------------------------------
+ *
+ * /proc/pressure/<res> looks like:
+ *     some avg10=0.00 avg60=0.12 avg300=0.05 total=1234
+ *     full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+ *
+ * "some" is the share of time at least one task was stalled, which is the
+ * number C0ry alerts on. avg60 rather than avg10: a moon that flickered on
+ * every one-second hiccup would be noise, not information.
+ *
+ * Parsed as integers -- "0.12" becomes 1 tenth of a percent -- rather than
+ * with atof, because there is no reason for a float to exist here. */
+static int psi_read(const char* resource) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/pressure/%s", resource);
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;                    /* kernel without PSI, or a container */
+    char line[256];
+    int out = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "some", 4) != 0) continue;
+        const char* p = strstr(line, "avg60=");
+        if (!p) break;
+        p += 6;
+        int whole = 0;
+        while (*p >= '0' && *p <= '9') { whole = whole * 10 + (*p - '0'); p++; }
+        int tenths = 0;
+        if (*p == '.' && p[1] >= '0' && p[1] <= '9') tenths = p[1] - '0';
+        out = whole * 10 + tenths;
+        break;
+    }
+    fclose(f);
+    return out;
+}
+
+void plat_pressure(PlatPressure* out) {
+    if (!out) return;
+    out->disk_used = -1; out->disk_free_mb = 0; out->disk_total_mb = 0;
+    {
+        struct statvfs vfs;
+        if (statvfs("/", &vfs) == 0 && vfs.f_blocks > 0) {
+            unsigned long long bs    = (unsigned long long)vfs.f_frsize;
+            unsigned long long total = (unsigned long long)vfs.f_blocks * bs;
+            unsigned long long avail = (unsigned long long)vfs.f_bavail * bs;
+            out->disk_total_mb = (int)(total / (1024 * 1024));
+            out->disk_free_mb  = (int)(avail / (1024 * 1024));
+            if (total > 0)
+                out->disk_used = (int)(((total - avail) * 1000ULL) / total);
+        }
+    }
+    out->mem = psi_read("memory");
+    out->cpu = psi_read("cpu");
+    out->io  = psi_read("io");
+    /* If PSI is absent the values are -1 and nothing should claim otherwise. */
+    out->true_stall = (out->mem >= 0 || out->cpu >= 0 || out->io >= 0);
+}
+
+/* ---- start another copy of ourselves ---------------------------------- */
+bool plat_spawn_self(const char* args) {
+    char exe[512];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return false;
+    exe[n] = 0;
+
+    pid_t p = fork();
+    if (p < 0) return false;
+    if (p != 0) return true;             /* parent: carry on */
+
+    /* Child. Split the argument string on spaces -- we build it ourselves and
+     * it deliberately contains no paths, precisely so this can stay this
+     * simple. */
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", args ? args : "");
+    char* argv[24];
+    int ac = 0;
+    argv[ac++] = exe;
+    char* c = buf;
+    while (*c && ac < 23) {
+        while (*c == ' ') c++;
+        if (!*c) break;
+        argv[ac++] = c;
+        while (*c && *c != ' ') c++;
+        if (*c) *c++ = 0;
+    }
+    argv[ac] = NULL;
+
+    setsid();                            /* survive the parent's terminal */
+    execv(exe, argv);
+    _exit(127);                          /* only reached if execv failed */
+}
+
+void plat_temp_dir(char* out, size_t sz) {
+    /* XDG_RUNTIME_DIR is tmpfs, so on Linux this really is in RAM. */
+    const char* t = getenv("XDG_RUNTIME_DIR");
+    if (!t || !*t) t = getenv("TMPDIR");
+    if (!t || !*t) t = "/tmp";
+    snprintf(out, sz, "%s/", t);
+}
+
 /* ---- 2D fallback painting ---------------------------------------------
  * Xlib arcs into a pixmap, then one copy to the window. Same reasoning as
  * the Win32 side: the window's shape mask makes it round, so this only has
@@ -2102,7 +2289,7 @@ void plat_draw_orb_2d(struct GLFWwindow* w, int win_size, int orb_size,
  * An abstract-namespace unix socket: bound to the kernel rather than the
  * filesystem, so it vanishes with the process and leaves nothing to go
  * stale. Same contract as the Windows named mutex. */
-bool plat_single_instance(void) {
+bool plat_single_instance(const char* tag) {
     static int held = -1;
     if (held >= 0) return true;
     /* CLOEXEC, or every child inherits the lock. This program spawns

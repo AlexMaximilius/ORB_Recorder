@@ -438,7 +438,8 @@ void plat_window_set_circular(struct GLFWwindow* w, int diameter) {
 
 void plat_window_set_shape(struct GLFWwindow* w,
                            int bx, int by, int diameter,
-                           int rx, int ry, int rw, int rh) {
+                           int rx, int ry, int rw, int rh,
+                           int mx, int my, int md) {
     HWND h = glfwGetWin32Window(w);
     if (diameter <= 0) { SetWindowRgn(h, NULL, TRUE); return; }
     HRGN rgn = CreateEllipticRgn(bx, by, bx + diameter + 1, by + diameter + 1);
@@ -448,6 +449,13 @@ void plat_window_set_shape(struct GLFWwindow* w,
         if (bar) {
             CombineRgn(rgn, rgn, bar, RGN_OR);
             DeleteObject(bar);
+        }
+    }
+    if (md > 0) {
+        HRGN moon = CreateEllipticRgn(mx, my, mx + md + 1, my + md + 1);
+        if (moon) {
+            CombineRgn(rgn, rgn, moon, RGN_OR);
+            DeleteObject(moon);
         }
     }
     SetWindowRgn(h, rgn, TRUE);   /* window owns the region now */
@@ -496,8 +504,59 @@ void* plat_get_orb_native_handle(struct GLFWwindow* w) {
 bool plat_handles_equal(void* a, void* b) { return a == b; }
 
 /* ---- capture ---------------------------------------------------------- */
+/* Off by default until the core says otherwise; see plat_capture_draw_cursor. */
+static bool g_cap_cursor = false;
+void plat_capture_draw_cursor(bool on) { g_cap_cursor = on; }
+
+/* Composite the live pointer into a capture already sitting in `memDC`.
+ *
+ * (originX, originY) is where the captured area starts in SCREEN coordinates,
+ * which is the only frame the cursor position is reported in. srcW/srcH vs
+ * capW/capH gives the scale, because captures are usually downsized.
+ *
+ * The DIB must still be selected into memDC when this runs -- drawing after
+ * SelectObject puts the pointer on a bitmap nobody is going to read. */
+static void draw_cursor_into(HDC memDC, int originX, int originY,
+                             int srcW, int srcH, int capW, int capH) {
+    if (!g_cap_cursor || srcW <= 0 || srcH <= 0) return;
+
+    CURSORINFO ci;
+    memset(&ci, 0, sizeof ci);
+    ci.cbSize = sizeof ci;
+    if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor)
+        return;
+
+    ICONINFO ii;
+    memset(&ii, 0, sizeof ii);
+    if (!GetIconInfo(ci.hCursor, &ii)) return;
+
+    /* The hotspot is the pixel that actually points at things; the bitmap
+     * hangs off it. Subtract it or the arrow lands down-right of the truth. */
+    int sx = ci.ptScreenPos.x - (int)ii.xHotspot - originX;
+    int sy = ci.ptScreenPos.y - (int)ii.yHotspot - originY;
+
+    /* A cursor is square-ish and sized by the system, not by the icon
+     * bitmap -- a mask-only cursor (the I-beam) has a double-height mask. */
+    int cw = GetSystemMetrics(SM_CXCURSOR);
+    int ch = GetSystemMetrics(SM_CYCURSOR);
+
+    int dx = MulDiv(sx, capW, srcW);
+    int dy = MulDiv(sy, capH, srcH);
+    int dw = MulDiv(cw, capW, srcW);
+    int dh = MulDiv(ch, capH, srcH);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+
+    /* Wholly outside the frame -- skip rather than let GDI clip it. */
+    if (dx + dw > 0 && dy + dh > 0 && dx < capW && dy < capH)
+        DrawIconEx(memDC, dx, dy, ci.hCursor, dw, dh, 0, NULL, DI_NORMAL);
+
+    if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+}
+
 static uint8_t* capture_dc(HDC srcDC, int srcX, int srcY, int srcW, int srcH,
-                           int capW, int capH) {
+                           int capW, int capH, int originX, int originY) {
     HDC memDC = CreateCompatibleDC(srcDC);
     BITMAPINFO bmi;
     memset(&bmi, 0, sizeof bmi);
@@ -513,6 +572,8 @@ static uint8_t* capture_dc(HDC srcDC, int srcX, int srcY, int srcW, int srcH,
     HGDIOBJ oldBmp = SelectObject(memDC, dib);
     SetStretchBltMode(memDC, HALFTONE);
     StretchBlt(memDC, 0, 0, capW, capH, srcDC, srcX, srcY, srcW, srcH, SRCCOPY);
+    /* While the DIB is still selected. */
+    draw_cursor_into(memDC, originX, originY, srcW, srcH, capW, capH);
     SelectObject(memDC, oldBmp);
 
     int npix = capW * capH;
@@ -636,6 +697,16 @@ uint8_t* plat_capture_window(void* handle, int capW, int capH,
     HGDIOBJ oldScale = SelectObject(scaleDC, scaleDib);
     SetStretchBltMode(scaleDC, HALFTONE);
     StretchBlt(scaleDC, 0, 0, capW, capH, memDC, 0, 0, sW, sH, SRCCOPY);
+    /* The pointer goes on AFTER the downscale, so it stays crisp instead of
+     * being resampled with the rest of the frame. The window's top-left is
+     * the origin the cursor's screen position is measured against -- asked
+     * for here rather than reused from further up, where it lives inside a
+     * block that only the elevated-window path enters. */
+    {
+        RECT cwr;
+        if (GetWindowRect(target, &cwr))
+            draw_cursor_into(scaleDC, cwr.left, cwr.top, sW, sH, capW, capH);
+    }
     SelectObject(scaleDC, oldScale);
 
     int npix = capW * capH;
@@ -678,7 +749,8 @@ uint8_t* plat_capture_window(void* handle, int capW, int capH,
 uint8_t* plat_capture_rect(int x, int y, int w, int h, int capW, int capH) {
     HDC screenDC = GetDC(NULL);
     if (!screenDC) return NULL;
-    uint8_t* px = capture_dc(screenDC, x, y, w, h, capW, capH);
+    /* A screen capture's origin IS its screen position. */
+    uint8_t* px = capture_dc(screenDC, x, y, w, h, capW, capH, x, y);
     ReleaseDC(NULL, screenDC);
     return px;
 }
@@ -902,6 +974,19 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
         AppendMenuA(root, MF_POPUP, (UINT_PTR)ch,
                     "Clipboard history (middle-click) >");
     }
+    AppendMenuA(root, MF_STRING | (st->draw_cursor ? MF_CHECKED : MF_UNCHECKED),
+                PLAT_MENU_TOGGLE_CURSOR, "Record the mouse pointer");
+    AppendMenuA(root, MF_STRING | (st->moon_on ? MF_CHECKED : MF_UNCHECKED),
+                PLAT_MENU_TOGGLE_MOON, "Moon (C0ry)");
+    if (st->ghost_on) {
+        AppendMenuA(root, MF_STRING, PLAT_MENU_FILM_STOP,
+                    "Stop filming the orb");
+    } else {
+        HMENU fm = CreatePopupMenu();
+        AppendMenuA(fm, MF_STRING, PLAT_MENU_FILM_GIF, "as GIF");
+        AppendMenuA(fm, MF_STRING, PLAT_MENU_FILM_MP4, "as MP4");
+        AppendMenuA(root, MF_POPUP, (UINT_PTR)fm, "Film the orb itself >");
+    }
     AppendMenuA(root, MF_STRING | (st->tray_only ? MF_CHECKED : MF_UNCHECKED),
                 PLAT_MENU_TOGGLE_TRAY,     "Tray icon only");
     AppendMenuA(root, MF_STRING, PLAT_MENU_HIDE_ORB,
@@ -952,6 +1037,86 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
     apply_taskbar_button(h, st && st->tray_only);
 
     return cmd;
+}
+
+/* ---- pressure, as close as Windows gets -------------------------------
+ *
+ * There is no PSI here. Windows can say how FULL memory is and how BUSY the
+ * CPU is, neither of which is what PSI measures -- a machine can be at 95%
+ * memory with nothing waiting on it. So these are reported for what they are
+ * and `true_stall` is false, rather than dressing utilisation up as pressure.
+ *
+ * IO is left unmeasured instead of guessed. -1 is an honest answer. */
+void plat_pressure(PlatPressure* out) {
+    if (!out) return;
+    out->mem = -1; out->cpu = -1; out->io = -1;
+    out->true_stall = false;
+
+    out->disk_used = -1; out->disk_free_mb = 0; out->disk_total_mb = 0;
+
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) out->mem = (int)ms.dwMemoryLoad * 10;
+
+    /* The drive Windows itself is on -- the one whose filling up breaks
+     * everything, rather than whichever one we happen to save GIFs to. */
+    ULARGE_INTEGER avail, total, freebytes;
+    char sysdir[MAX_PATH] = "C:\\";
+    if (GetWindowsDirectoryA(sysdir, MAX_PATH) >= 3) sysdir[3] = 0;
+    if (GetDiskFreeSpaceExA(sysdir, &avail, &total, &freebytes) &&
+        total.QuadPart > 0) {
+        out->disk_total_mb = (int)(total.QuadPart / (1024 * 1024));
+        out->disk_free_mb  = (int)(avail.QuadPart / (1024 * 1024));
+        unsigned long long used = total.QuadPart - avail.QuadPart;
+        out->disk_used = (int)((used * 1000ULL) / total.QuadPart);
+    }
+
+    /* CPU busy over the interval between calls. The first call has no
+     * previous sample to difference against, so it reports -1 rather than a
+     * meaningless figure computed from boot. */
+    static ULONGLONG p_idle = 0, p_kern = 0, p_user = 0;
+    FILETIME fi, fk, fu;
+    if (GetSystemTimes(&fi, &fk, &fu)) {
+        ULONGLONG i = ((ULONGLONG)fi.dwHighDateTime << 32) | fi.dwLowDateTime;
+        ULONGLONG k = ((ULONGLONG)fk.dwHighDateTime << 32) | fk.dwLowDateTime;
+        ULONGLONG u = ((ULONGLONG)fu.dwHighDateTime << 32) | fu.dwLowDateTime;
+        if (p_kern || p_user) {
+            ULONGLONG di = i - p_idle, dk = k - p_kern, du = u - p_user;
+            ULONGLONG total = dk + du;          /* kernel time includes idle */
+            if (total > 0 && di <= total)
+                out->cpu = (int)(((total - di) * 1000ULL) / total);
+        }
+        p_idle = i; p_kern = k; p_user = u;
+    }
+}
+
+/* ---- start another copy of ourselves ---------------------------------- */
+bool plat_spawn_self(const char* args) {
+    char exe[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, exe, MAX_PATH)) return false;
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "\"%s\" %s", exe, args ? args : "");
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    memset(&pi, 0, sizeof pi);
+
+    /* CREATE_NO_WINDOW: the ghost has no console and must not flash one --
+     * a console window appearing would land in the very recording it is
+     * being started to make. */
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi))
+        return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);   /* it outlives us; we do not wait on it */
+    return true;
+}
+
+void plat_temp_dir(char* out, size_t sz) {
+    DWORD n = GetTempPathA((DWORD)sz, out);
+    if (n == 0 || n >= sz) snprintf(out, sz, "C:\\Temp\\");
 }
 
 /* ---- image helpers: borrow the shell's decoders + thumbnail cache ------ */
@@ -1501,11 +1666,14 @@ void plat_draw_orb_2d(struct GLFWwindow* w, int win_size, int orb_size,
  * first already owns them -- so it starts with every capture key dead and a
  * menu full of unchecked boxes, which reads as a broken install rather than
  * a duplicate. */
-bool plat_single_instance(void) {
+bool plat_single_instance(const char* tag) {
     static HANDLE held = NULL;
     if (held) return true;
     SetLastError(0);
-    held = CreateMutexA(NULL, TRUE, "Local\\324x_ORB_Recorder_single");
+    char name[128];
+    snprintf(name, sizeof name, "Local\\324x_ORB_Recorder_%s",
+             (tag && *tag) ? tag : "single");
+    held = CreateMutexA(NULL, TRUE, name);
     if (!held) return true;                 /* cannot tell -- do not block */
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(held);
