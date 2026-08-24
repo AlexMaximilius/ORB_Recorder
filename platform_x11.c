@@ -953,6 +953,11 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
     n = menu_sep(rows, n);
     n = menu_add(rows, n, PLAT_MENU_TOGGLE_CURSOR,   "%sRecord the mouse pointer", onoff(st->draw_cursor));
     n = menu_add(rows, n, PLAT_MENU_TOGGLE_MOON,     "%sMoon (C0ry)", onoff(st->moon_on));
+    if (st->moon_on) {
+        static const char* MSN[PLAT_MOONSTYLE_COUNT] = { "Circular", "Lively", "Comet", "Wild" };
+        n = menu_add(rows, n, PLAT_MENU_MOONSTYLE_BASE + ((st->moon_style + 1) % PLAT_MOONSTYLE_COUNT),
+                     "  Moon orbit: %s", MSN[st->moon_style]);
+    }
     if (st->ghost_on)
         n = menu_add(rows, n, PLAT_MENU_FILM_STOP,  "Stop filming the orb");
     else {

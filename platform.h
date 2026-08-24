@@ -200,6 +200,9 @@ enum {
     PLAT_MENU_FILM_MP4        = 166,   /* ghost-record the orb -> MP4     */
     PLAT_MENU_FILM_STOP       = 167,
     PLAT_MENU_TOGGLE_CURSOR   = 168,   /* record the mouse pointer        */
+    PLAT_MENU_MOONSTYLE_BASE  = 170,   /* +0..3 how the moon flies        */
+#define PLAT_MOONSTYLE_COUNT 4
+    PLAT_MENU_MOONSTYLE_LAST  = 173,
     PLAT_MENU_MONITOR_BASE    = 200,   /* GIF:   + monitor index */
     PLAT_MENU_VMONITOR_BASE   = 300,   /* VIDEO: + monitor index */
     PLAT_MENU_CAMERA_BASE     = 400    /* CAMERA: + device index */
@@ -221,6 +224,7 @@ typedef struct {
     bool moon_on;        /* the moon circling the orb */
     bool ghost_on;       /* a ghost recorder is filming right now */
     bool draw_cursor;    /* draw the mouse pointer into recordings */
+    int  moon_style;     /* 0 circular .. 3 wild */
 } PlatMenuState;
 
 int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,

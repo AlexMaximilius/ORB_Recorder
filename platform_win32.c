@@ -978,6 +978,15 @@ int plat_show_menu(struct GLFWwindow* w, const PlatMenuState* st,
                 PLAT_MENU_TOGGLE_CURSOR, "Record the mouse pointer");
     AppendMenuA(root, MF_STRING | (st->moon_on ? MF_CHECKED : MF_UNCHECKED),
                 PLAT_MENU_TOGGLE_MOON, "Moon (C0ry)");
+    if (st->moon_on) {
+        HMENU ms = CreatePopupMenu();
+        static const char* MSN[PLAT_MOONSTYLE_COUNT] = {
+            "Circular", "Lively", "Comet", "Wild" };
+        for (int i = 0; i < PLAT_MOONSTYLE_COUNT; i++)
+            AppendMenuA(ms, MF_STRING | (st->moon_style == i ? MF_CHECKED : 0),
+                        PLAT_MENU_MOONSTYLE_BASE + (UINT)i, MSN[i]);
+        AppendMenuA(root, MF_POPUP, (UINT_PTR)ms, "  Moon orbit >");
+    }
     if (st->ghost_on) {
         AppendMenuA(root, MF_STRING, PLAT_MENU_FILM_STOP,
                     "Stop filming the orb");

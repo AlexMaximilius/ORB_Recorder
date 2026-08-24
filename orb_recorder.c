@@ -173,6 +173,7 @@ typedef struct {
     int  clip_keep;               /* clipboard entries remembered; 0 = off */
     bool moon_on;                 /* the little satellite -- C0ry */
     bool draw_cursor;             /* draw the mouse pointer into captures */
+    int  moon_style;              /* 0..3, the moon's eccentricity + speed */
     bool armed_video;             /* the pick in flight is MP4 */
     int  armed_mode;              /* ARM_* -- what the pick will do */
 
@@ -434,6 +435,15 @@ static char g_cfg_path[512];
  * and settings_load use them and the table itself lives further down. */
 extern const char* HK_NAMES[PLAT_HK_COUNT];
 
+/* The moon's tuning lives with the moon, far below, but settings_save and
+ * settings_load run long before it. Accessors rather than reaching into
+ * g_moon, which is not in scope up here. */
+static int  moon_ecc_get(void);
+static int  moon_speed_get(void);
+static void moon_ecc_set(int v);
+static void moon_speed_set(int v);
+static void moon_apply_style(void);
+
 static void settings_save(void) {
     /* The ghost is a guest in the main copy's configuration. It reads the
      * output folder and the frame rate and then keeps its hands off: writing
@@ -475,6 +485,11 @@ static void settings_save(void) {
     fprintf(f, "clip_keep=%d\n", g.clip_keep);
     fprintf(f, "moon=%d\n", g.moon_on ? 1 : 0);
     fprintf(f, "draw_cursor=%d\n", g.draw_cursor ? 1 : 0);
+    /* The style picks the pair; the pair is written too, so an orbit the
+     * menu does not offer is one edit away. */
+    fprintf(f, "moon_style=%d\n", g.moon_style);
+    fprintf(f, "moon_ecc=%d\n", moon_ecc_get());
+    fprintf(f, "moon_speed=%d\n", moon_speed_get());
     fclose(f);
     g.settings_dirty = false;
     log_write("cfg", "saved orb=(%d,%d) editor=(%d,%d %dx%d)",
@@ -553,6 +568,17 @@ static void settings_load(void) {
         else if (!strcmp(key, "dbl_video")) { g.dbl_video = val != 0; }
         else if (!strcmp(key, "moon")) { g.moon_on = val != 0; }
         else if (!strcmp(key, "draw_cursor")) { g.draw_cursor = val != 0; }
+        else if (!strcmp(key, "moon_style")) {
+            g.moon_style = (val < 0 || val >= PLAT_MOONSTYLE_COUNT) ? 1 : val;
+            /* Applied HERE, not after the whole file is read. moon_ecc and
+             * moon_speed are written after moon_style, so a hand-edited pair
+             * lands afterwards and wins -- which is what makes "an orbit the
+             * menu does not offer" actually possible. Applying the style at
+             * the end would silently overwrite it every launch. */
+            moon_apply_style();
+        }
+        else if (!strcmp(key, "moon_ecc"))   { moon_ecc_set(val); }
+        else if (!strcmp(key, "moon_speed")) { moon_speed_set(val); }
         else if (!strcmp(key, "clip_keep")) {
             g.clip_keep = (val < 0) ? 0 : (val > CLIP_MAX ? CLIP_MAX : val);
         }
@@ -1209,7 +1235,7 @@ static void stop_recording(void);   /* defined below */
 static GLFWwindow* g_help_win = NULL;
 
 static const char* HELP_LINES[] = {
-    "ORB_RECORDER  v3.20",
+    "ORB_RECORDER  v3.21",
     "  BY ALEX MAXIMILIUS (ALEX MAZ)  GITHUB.COM/ALEXMAXIMILIUS",
     "  PUBLIC DOMAIN, 2026",
     "  screenshots, GIF, MP4 with sound, camera, image viewer",
@@ -1244,7 +1270,10 @@ static const char* HELP_LINES[] = {
     "  RECORD MOUSE       RIGHT-CLICK MENU. ON BY DEFAULT.",
     "",
     "THE MOON",
-    "  A SMALL SATELLITE CIRCLES THE ORB. BRING THE",
+    "  A SMALL SATELLITE ORBITS THE ORB -- A REAL ORBIT,",
+    "  TILTED AND ELLIPTICAL, FASTER WHEN IT IS CLOSE.",
+    "  MOON ORBIT MENU: CIRCULAR / LIVELY / COMET / WILD.",
+    "  BRING THE",
     "  CURSOR NEAR AND IT COMES TO MEET YOU.",
     "  CLICK IT           WHAT THE MACHINE IS DOING",
     "  IT IS C0RY -- THE CORE MEMORY CONTROLLER.",
@@ -1788,24 +1817,87 @@ static const short MOON_SIN[MOON_STEPS] = {
 static int moon_sin(int step) { return MOON_SIN[((step % MOON_STEPS) + MOON_STEPS) % MOON_STEPS]; }
 static int moon_cos(int step) { return moon_sin(step + MOON_STEPS / 4); }
 
+/* ---- fine angles: SIXTY SIXTIETHS -------------------------------------
+ *
+ * A real orbit needs finer steps than sixty. Rather than carry a bigger
+ * table, subdivide each of the sixty positions into sixty again -- 3600 to
+ * the turn -- and interpolate between the two neighbouring entries.
+ *
+ * Still base 60, still a lookup, still no trigonometry and no float. Sine is
+ * near-linear over six degrees, so straight-line interpolation is wrong by
+ * about a part in seven hundred: a fifth of a pixel at this radius, which is
+ * to say invisible.
+ *
+ * Everything below is scaled by 1000, like the table. */
+#define MOON_TURN 3600
+static int moon_sinf(int a) {
+    a = ((a % MOON_TURN) + MOON_TURN) % MOON_TURN;
+    int i = a / 60, f = a % 60;
+    int s0 = MOON_SIN[i], s1 = MOON_SIN[(i + 1) % MOON_STEPS];
+    return s0 + (s1 - s0) * f / 60;
+}
+static int moon_cosf(int a) { return moon_sinf(a + MOON_TURN / 4); }
+
 static struct {
     int  x, y;        /* half-pixels from the window centre */
-    int  step;        /* orbit position, 0..59 */
-    int  sub;         /* fractional advance of `step`, in sixtieths */
-    int  inc,  inc_sub;    /* how edge-on the orbit is */
-    int  node, node_sub;   /* which way it is tilted */
-    int  depth;            /* +1000 nearest, -1000 furthest -- for size/light */
+    /* ORBITAL ELEMENTS, all angles in sixty-sixtieths (0..3599).
+     *
+     * This is a real orbit, not a drawn ellipse. Joe: *"the orbit of the moon
+     * should follow the gravity of the room... it should orbit on xyz not
+     * vertically and speed up and slow down."*
+     *
+     * nu    -- true anomaly: where the moon is, measured from periapsis
+     * argp  -- argument of periapsis: which way the ellipse points in-plane
+     * inc   -- inclination: how far the plane is tipped
+     * node  -- longitude of the ascending node: which way it is tipped
+     *
+     * inc, node and argp all drift, at rates sharing no common factor, so the
+     * plane wanders and the orbit never closes on itself. */
+    int  nu, nu_accum;
+    int  argp, argp_sub;
+    int  inc,  inc_sub;
+    int  node, node_sub;
+    int  ecc;              /* eccentricity x1000; 0 = a circle */
+    int  speed;            /* 1..10, how fast it goes round */
+    int  step;             /* nearest sixtieth, kept for rejoining an orbit */
+    int  sub;
+    int  depth;            /* +1000 nearest, -1000 furthest -- size and light */
     bool following;   /* the cursor is near enough that we are chasing it */
     int  last_rx, last_ry;   /* position the window region was last built for */
     bool region_stale;
-} g_moon = { 0, 0, 0, 0, 0, 0, 0, 0, 0, false, -9999, -9999, true };
+}
+/* Designated, not positional. The positional version was two short after the
+ * orbital elements went in, so 380 landed on `node` instead of `ecc` and the
+ * orbit came out a perfect circle -- the one thing this change was meant to
+ * stop it being. -Wmissing-field-initializers caught it; naming them means
+ * the next field added cannot silently shift the rest. */
+g_moon = {
+    .ecc          = 380,     /* a visibly elliptical orbit */
+    .speed        = 4,     /* ~15 s a lap */
+    .last_rx      = -9999,
+    .last_ry      = -9999,
+    .region_stale = true,
+};
 
 /* Everything about the moon's size derives from the orb's, so it stays a
  * moon when the orb is scrolled from 36 px to 240. ORB_VIS_RADIUS is the
  * radius the sphere actually paints at, which is much less than the viewport
  * it is drawn into -- using the viewport would put the moon miles away. */
 static int moon_radius(void)   { int r = ORB_VIS_RADIUS / 3; return r < 4 ? 4 : r; }
-static int moon_orbit_r(void)  { return ORB_VIS_RADIUS * 2 + moon_radius(); }
+static int moon_min_r(void);   /* the floor; sizing the orbit needs it */
+/* Semi-major axis, chosen so that PERIAPSIS clears the no-cover floor.
+ *
+ * An eccentric orbit's closest approach is a(1-e). Sizing the orbit without
+ * accounting for that puts periapsis inside the forbidden zone, where the
+ * floor clamps it -- and a clamped ellipse does not read as an orbit, it
+ * reads as the moon bouncing off an invisible wall once a lap. */
+static int moon_orbit_r(void) {
+    int base = ORB_VIS_RADIUS * 2 + moon_radius();
+    int e    = g_moon.ecc;
+    if (e > 900) e = 900;
+    int need = moon_min_r() * 1000 / (1000 - e) + 3;
+    return base > need ? base : need;
+}
 
 /* The orb must always be clickable.
  *
@@ -1842,35 +1934,55 @@ static int moon_isqrt(int v) {
     return r;
 }
 
-/* Where the moon sits at orbit position `step`, in half-pixels, for the
- * orbit's current orientation.
+/* Where the moon is, in half-pixels from the orb, for a true anomaly.
  *
- * A circle seen at an angle is an ellipse, so a tilted orbit is the unit
- * circle SQUASHED along one axis and then turned. `inc` squashes, `node`
- * turns. Both drift, at rates that do not divide into each other, so the moon
- * never retraces the same ellipse twice -- which is what makes it look like
- * it is going round something rather than round a drawing of something.
+ * The orbit equation, straight out of the two-body problem:
  *
- * *depth is how near the moon is: +1000 at the front of the orbit, -1000 at
- * the back. Nothing is occluded (the floor above sees to that), so depth is
- * spent on size and brightness instead, which is what sells it as 3D. */
+ *     r = a(1 - e^2) / (1 + e cos nu)
+ *
+ * then the standard rotation from the orbital plane into space by argument of
+ * periapsis, inclination and node:
+ *
+ *     X = r (cos O cos u - sin O sin u cos i)
+ *     Y = r (sin O cos u + cos O sin u cos i)
+ *     Z = r (sin u sin i)                        u = nu + argp
+ *
+ * X and Y are the screen; Z is depth, and is spent on size and brightness
+ * because the moon is never allowed in front of the orb to occlude anything.
+ *
+ * All integer, everything scaled by 1000. The intermediates are staged so the
+ * largest product is 1000 * 1000 -- a million -- rather than letting three
+ * scaled terms multiply into an overflow.
+ */
+static void moon_orbit_at(int nu, int* ox, int* oy, int* depth) {
+    int a = moon_orbit_r() * MOON_HP;
+    int e = g_moon.ecc;
+
+    /* r = a(1-e^2)/(1+e cos nu), in half-pixels. */
+    int cnu   = moon_cosf(nu);                       /* x1000 */
+    int num   = a * (1000 - (e * e) / 1000);         /* a(1-e^2) x1000 */
+    int denom = 1000 + (e * cnu) / 1000;             /* (1+e cos nu) x1000 */
+    if (denom < 1) denom = 1;
+    int r = num / denom;
+
+    int u  = nu + g_moon.argp;
+    int cu = moon_cosf(u), su = moon_sinf(u);
+    int ci = moon_cosf(g_moon.inc),  si = moon_sinf(g_moon.inc);
+    int cO = moon_cosf(g_moon.node), sO = moon_sinf(g_moon.node);
+
+    int suci = (su * ci) / 1000;                     /* x1000 */
+    int sx = (cO * cu) / 1000 - (sO * suci) / 1000;  /* x1000 */
+    int sy = (sO * cu) / 1000 + (cO * suci) / 1000;  /* x1000 */
+    int sz = (su * si) / 1000;                       /* x1000 */
+
+    *ox = (r * sx) / 1000;
+    *oy = (r * sy) / 1000;
+    if (depth) *depth = sz;                          /* -1000..+1000 */
+}
+
+/* Kept for the rejoin search, which thinks in sixtieths. */
 static void moon_orbit_pos(int step, int* ox, int* oy, int* depth) {
-    /* Squash factor, 620..1000. Never fully edge-on: at zero the moon would
-     * slide along a straight line through the orb, which reads as a glitch. */
-    int flat = 810 + 190 * moon_cos(g_moon.inc) / 1000;
-
-    int c  = moon_cos(step);                  /* x1000 */
-    int sf = moon_sin(step) * flat / 1000;    /* x1000, squashed */
-
-    int nc = moon_cos(g_moon.node), ns = moon_sin(g_moon.node);
-    int ex = (c * nc - sf * ns) / 1000;
-    int ey = (c * ns + sf * nc) / 1000;
-
-    int r = moon_orbit_r() * MOON_HP;
-    *ox = r * ex / 1000;
-    *oy = r * ey / 1000;
-    /* What the squash took out of the plane is what came towards you. */
-    if (depth) *depth = moon_sin(step) * (1000 - flat) / 1000 * 1000 / 380;
+    moon_orbit_at(step * (MOON_TURN / MOON_STEPS), ox, oy, depth);
 }
 
 static void moon_region_rect(int* bx, int* by, int* d) {
@@ -1881,6 +1993,42 @@ static void moon_region_rect(int* bx, int* by, int* d) {
     *d  = r * 2;
     *bx = ORB_WIN_SIZE / 2 + g_moon.x / MOON_HP - r;
     *by = ORB_WIN_SIZE / 2 + g_moon.y / MOON_HP - r;
+}
+
+/* ---- how the moon flies ------------------------------------------------
+ *
+ * Joe: *"this opens up a new way for us to be creative and make settings for
+ * how it is about."*
+ *
+ * Two numbers describe the whole character of an orbit -- how elliptical, and
+ * how fast -- so the menu offers four pairs rather than making anyone think in
+ * eccentricities. The raw pair is written to settings.ini as well, so an orbit
+ * the menu does not offer is an edit away.
+ *
+ * Eccentricity is capped below 0.7: past that the orbit is so lopsided that
+ * apoapsis leaves the window while periapsis pins against the no-cover floor,
+ * and the result reads as a fault rather than a flourish. */
+static const char* MOON_STYLE_NAMES[PLAT_MOONSTYLE_COUNT] = {
+    "Circular", "Lively", "Comet", "Wild"
+};
+static const int MOON_STYLE_ECC[PLAT_MOONSTYLE_COUNT]   = {   0, 380, 560, 660 };
+static const int MOON_STYLE_SPEED[PLAT_MOONSTYLE_COUNT] = {   3,   4,   6,   9 };
+
+static int  moon_ecc_get(void)   { return g_moon.ecc; }
+static int  moon_speed_get(void) { return g_moon.speed; }
+static void moon_ecc_set(int v) {
+    g_moon.ecc = (v < 0) ? 0 : (v > 700 ? 700 : v);
+}
+static void moon_speed_set(int v) {
+    g_moon.speed = (v < 1) ? 1 : (v > 12 ? 12 : v);
+}
+
+static void moon_apply_style(void) {
+    int i = g.moon_style;
+    if (i < 0 || i >= PLAT_MOONSTYLE_COUNT) i = 1;
+    g_moon.ecc   = MOON_STYLE_ECC[i];
+    g_moon.speed = MOON_STYLE_SPEED[i];
+    g_moon.region_stale = true;
 }
 
 static bool moon_region_dirty(void) {
@@ -1908,8 +2056,9 @@ static void moon_tick(void) {
      * the cursor -- so it rejoins a slightly different orbit than the one it
      * left. Two different periods, neither a multiple of the other, which is
      * what keeps the whole thing from looking like a loop. */
-    if (++g_moon.inc_sub  >= 47) { g_moon.inc_sub  = 0; g_moon.inc  = (g_moon.inc  + 1) % MOON_STEPS; }
-    if (++g_moon.node_sub >= 29) { g_moon.node_sub = 0; g_moon.node = (g_moon.node + 1) % MOON_STEPS; }
+    if (++g_moon.inc_sub  >= 13) { g_moon.inc_sub  = 0; g_moon.inc  = (g_moon.inc  + 1) % MOON_TURN; }
+    if (++g_moon.node_sub >=  7) { g_moon.node_sub = 0; g_moon.node = (g_moon.node + 1) % MOON_TURN; }
+    if (++g_moon.argp_sub >= 19) { g_moon.argp_sub = 0; g_moon.argp = (g_moon.argp + 1) % MOON_TURN; }
 
     /* Near enough to notice? Compared squared, so no square root. */
     int nr = moon_notice_r();
@@ -1937,12 +2086,41 @@ static void moon_tick(void) {
          * all -- it reads as something spinning, and it pulls the eye
          * constantly. A moon should be somewhere slightly different when you
          * next glance at it, not visibly moving while you work. */
-        g_moon.sub += 1;
-        if (g_moon.sub >= MOON_FRAMES_PER_STEP) {
-            g_moon.sub = 0;
-            g_moon.step = (g_moon.step + 1) % MOON_STEPS;
+        /* KEPLER'S SECOND LAW. A moon sweeps equal areas in equal times, so
+         * its angular rate goes as 1/r^2: it hurries through periapsis and
+         * coasts through apoapsis. That is where the speeding up and slowing
+         * down comes from -- it is not an effect added on top, it is what an
+         * orbit does, and leaving it out is what made the first version read
+         * as a spinning graphic rather than a body going round something.
+         *
+         * Accumulate rate and step when it crosses the threshold, so slow
+         * stretches advance a fraction of a step per frame instead of
+         * stalling.
+         */
+        {
+            int rx, ry;
+            moon_orbit_at(g_moon.nu, &rx, &ry, &g_moon.depth);
+            int a = moon_orbit_r() * MOON_HP;
+            int r = moon_isqrt(rx * rx + ry * ry);
+            if (r < 1) r = 1;
+            /* rate = (a/r)^2, scaled so that r == a gives exactly 1000.
+             *
+             * Written as one division of a pre-scaled numerator, NOT as
+             * (a*1000/r) squared: that form truncates to 2 near periapsis and
+             * to ZERO out at apoapsis, where the minimum clamp then took over
+             * and drove the moon round twenty-five times FASTER at its
+             * furthest point. Precisely backwards, and invisible without
+             * checking the numbers. */
+            int rate = (a * a * 1000) / (r * r);
+            if (rate < 10) rate = 10;
+            g_moon.nu_accum += rate * g_moon.speed;
+            while (g_moon.nu_accum >= 1000) {
+                g_moon.nu_accum -= 1000;
+                g_moon.nu = (g_moon.nu + 1) % MOON_TURN;
+            }
+            moon_orbit_at(g_moon.nu, &tx, &ty, &g_moon.depth);
+            g_moon.step = (g_moon.nu * MOON_STEPS) / MOON_TURN;
         }
-        moon_orbit_pos(g_moon.step, &tx, &ty, &g_moon.depth);
     }
 
     /* Never on top of the orb. Push the TARGET out to the floor rather than
@@ -1982,7 +2160,10 @@ static void moon_tick(void) {
             int e = ex * ex + ey * ey;
             if (e < bestd) { bestd = e; best = i; }
         }
-        if (bestd > (r / 3) * (r / 3)) g_moon.step = best;
+        if (bestd > (r / 3) * (r / 3)) {
+            g_moon.step = best;
+            g_moon.nu   = best * (MOON_TURN / MOON_STEPS);
+        }
     }
 
     /* The region only has to be rebuilt when the moon has actually moved a
@@ -4676,6 +4857,7 @@ static PlatMenuState menu_state(void) {
      * itself on its timer since we last looked. */
     st.ghost_on  = ghost_is_running();
     st.draw_cursor = g.draw_cursor;
+    st.moon_style  = g.moon_style;
     /* Asked of the OS every time the menu opens, not remembered -- the
      * user can remove the entry from Settings and the tick must follow. */
     st.run_at_startup = plat_get_run_at_startup();
@@ -4793,6 +4975,16 @@ static void handle_menu_command(int cmd) {
         film_the_orb(true);
     } else if (cmd == PLAT_MENU_FILM_STOP) {
         film_the_orb(false);            /* running -> this stops it */
+    } else if (cmd >= PLAT_MENU_MOONSTYLE_BASE &&
+               cmd <= PLAT_MENU_MOONSTYLE_LAST) {
+        g.moon_style = cmd - PLAT_MENU_MOONSTYLE_BASE;
+        moon_apply_style();
+        popup("MOON", "%s orbit -- eccentricity 0.%02d, speed %d.",
+              MOON_STYLE_NAMES[g.moon_style],
+              g_moon.ecc / 10, g_moon.speed);
+        settings_mark_dirty();
+        log_write("moon", "style %s (ecc=%d speed=%d)",
+                  MOON_STYLE_NAMES[g.moon_style], g_moon.ecc, g_moon.speed);
     } else if (cmd == PLAT_MENU_TOGGLE_CURSOR) {
         g.draw_cursor = !g.draw_cursor;
         plat_capture_draw_cursor(g.draw_cursor);
@@ -5621,6 +5813,8 @@ int main(int argc, char** argv) {
      * moon chasing his mouse and it read as the moon having a fit,
      * because the thing it was chasing could not be seen. */
     g.draw_cursor    = true;
+    g.moon_style     = 1;      /* lively */
+    moon_apply_style();        /* defaults; settings_load may override */
     g.audio_src      = PLAT_AUDIO_SYSTEM;   /* settings_load may override */
     for (int i = 0; i < PLAT_HK_COUNT; i++) g.hotkey_on[i] = true;
     g.gw_open = false;

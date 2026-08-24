@@ -56,7 +56,8 @@ the annotation editor. Videos open in your default player.
 can finally capture it at rest rather than permanently red. **The mouse pointer
 is drawn into recordings**, and clicking the orb splashes colour across its cage.
 
-**The orb has a moon.** It circles, and comes to meet your cursor when you
+**The orb has a moon** on a real orbit — tilted, elliptical, and faster when
+it swings close, because it obeys Kepler rather than an animation curve. It circles, and comes to meet your cursor when you
 get close. It is C0ry — the Core Memory Controller — and its colour is how
 hard the machine is straining, measured as time spent *waiting* rather than
 time spent busy.
@@ -67,6 +68,76 @@ default; anything a password manager marks secret is refused.
 
 Colour is state: orange idle, yellow armed, **red recording GIF**, **magenta
 recording video**, **cyan recording camera**, green editing.
+
+---
+
+## New in 3.21 — the moon gets an actual orbit
+
+Joe: *"the orbit of the moon should follow the gravity of the room... I meant
+it should orbit on xyz not vertically and speed up and slow down."*
+
+He was right that what was there before was not an orbit. It was a **drawn
+ellipse** — a squashed circle swept at a constant rate. This is orbital
+elements and the two-body orbit equation:
+
+```
+r = a(1 - e²) / (1 + e·cos ν)
+
+X = r(cos Ω cos u − sin Ω sin u cos i)
+Y = r(sin Ω cos u + cos Ω sin u cos i)      u = ν + ω
+Z = r(sin u sin i)
+```
+
+Inclination, longitude of the ascending node and argument of periapsis all
+drift, at 13, 7 and 19 frames — no common factor, so the plane wanders and the
+orbit never closes on itself. `Z` reaches 305/1000: genuinely out of the
+screen plane, which is the XYZ that was asked for.
+
+**The speeding up and slowing down is not an effect.** It is Kepler's second
+law: a body sweeps equal areas in equal times, so its angular rate goes as
+1/r² and it hurries through periapsis and coasts through apoapsis. Measured on
+the shipped integer code: **4.8× faster at periapsis where theory says 5.0×**,
+with the swept area differing 4% between the extremes.
+
+### Still base 60 — twice
+
+A real orbit needs finer steps than sixty. Rather than carry a bigger table,
+each sixtieth is subdivided into sixty again — **3600 to the turn** — and the
+value interpolated between neighbouring entries. Sine is near-linear over six
+degrees, so the error is about one part in seven hundred: a fifth of a pixel
+at this radius. Still a lookup, still no trigonometry, still no floating point.
+
+### Two bugs worth naming
+
+Both were found by porting the integer arithmetic to a scratch harness and
+checking the orbital properties, rather than by looking at the screen.
+
+**The rate was inverted.** `(a*1000/r)²/1000000` truncates to 2 near periapsis
+and to *zero* at apoapsis, where the minimum clamp then took over — so the
+moon ran twenty-five times faster at its furthest point. Precisely backwards,
+and invisible without checking the numbers. Written as one division of a
+pre-scaled numerator, it is correct and keeps its precision.
+
+**Periapsis dipped inside the no-cover floor**, so once a lap the moon would
+have bounced off an invisible wall. The semi-major axis is now derived *from*
+the floor — `a ≥ min_r/(1−e)` — so a more eccentric orbit grows to keep its
+closest approach legal instead of being clamped.
+
+### Settings, because an orbit has a character
+
+Two numbers describe the whole feel of an orbit, so the menu offers four pairs
+rather than making anyone think in eccentricities:
+
+| | eccentricity | speed |
+|---|---|---|
+| Circular | 0.00 | 3 |
+| **Lively** (default) | 0.38 | 4 |
+| Comet | 0.56 | 6 |
+| Wild | 0.66 | 9 |
+
+`moon_ecc` and `moon_speed` are written to `settings.ini` too, and read *after*
+`moon_style`, so an orbit the menu does not offer is one edit away rather than
+being overwritten on every launch.
 
 ---
 
